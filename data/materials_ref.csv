@@ -1,0 +1,21 @@
+material,family,price_eur_kg,density_g_cm3,co2_kg_per_kg,supply_risk,process_factor,supplier_category,note
+Case-hardening steel 20MnCr5,Acier,1.9,7.85,2.3,1,5.0,Forge & taillage d'engrenages,"Acier de cémentation courant, multi-sources UE"
+Case-hardening steel 16MnCr5,Acier,1.8,7.85,2.3,1,4.0,Forge & taillage d'engrenages,Multi-sources UE
+Bearing steel 100Cr6 (AISI 52100),Acier,2.4,7.83,2.6,2,8.0,Roulementier,"Pièce achetée catalogue ; délais longs, peu de fabricants"
+Steel class 10.9 (zinc-flake coated),Acier,1.6,7.85,2.5,1,6.0,Visserie,"Standard, multi-sources"
+Alloy steel 42CrMo4 (quenched and tempered),Acier,1.7,7.85,2.4,1,4.0,Forge & usinage arbres,Multi-sources
+Structural steel S355J2,Acier,0.9,7.85,2.0,1,3.0,Tôlerie / découpe,Commodité
+Electrical steel M235-35A (laminated),Acier électrique,2.8,7.65,2.8,3,2.2,Découpe de tôles magnétiques,"Capacité UE limitée en tôles NO fines, forte demande VE"
+Copper Cu-ETP (enamelled wire),Cuivre,10.5,8.94,4.0,3,1.6,Fil émaillé / bobinage,Cours LME très volatil
+Aluminium alloy EN AC-AlSi9Cu3(Fe) (HPDC),Aluminium,2.6,2.75,6.0,2,3.0,Fonderie sous pression alu,"Prix LME volatil, alliage de seconde fusion"
+Aluminium alloy EN AC-AlSi10Mg (cast),Aluminium,2.9,2.68,7.5,2,3.0,Fonderie sous pression alu,Prix LME volatil
+Aluminium alloy EN AW-6082-T6,Aluminium,3.4,2.7,9.0,2,2.8,Extrusion & usinage alu,Prix LME volatil
+Ductile cast iron EN-GJS-600-3,Fonte,1.1,7.1,1.8,1,2.5,Fonderie fonte,Multi-sources UE
+FKM fluoroelastomer (steel-reinforced),Élastomère,45.0,1.85,12.0,3,3.0,Joints élastomères,Fluoropolymère : restriction PFAS UE en préparation
+Polyamide PA66-GF30,Polymère,3.6,1.36,7.0,2,2.5,Injection plastique,Tensions récurrentes sur le PA66
+Magnesium alloy AZ91D (HPDC),Magnésium,4.2,1.81,25.0,3,3.2,Fonderie sous pression magnésium,≈85 % de la production mondiale en Chine
+Recycled aluminium AlSi9Cu3 (≥75 % secondary),Aluminium,2.4,2.75,3.0,2,3.0,Fonderie sous pression alu,Alternative bas carbone
+Aluminium winding wire EC-Al (enamelled),Aluminium,3.5,2.7,8.5,2,1.8,Fil émaillé / bobinage,"Substitut du cuivre, section plus grande"
+HNBR elastomer (steel-reinforced),Élastomère,18.0,1.25,6.0,1,3.0,Joints élastomères,Alternative sans PFAS
+Polyamide PA6-GF30,Polymère,2.9,1.36,6.0,1,2.5,Injection plastique,Alternative au PA66
+Case-hardening steel 18CrNiMo7-6,Acier,3.2,7.85,3.0,2,5.0,Forge & taillage d'engrenages,"Plus résistant, contient Ni/Mo"
