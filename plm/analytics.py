@@ -13,9 +13,21 @@ from .parser import PlmModel
 RISK_LABEL = {1: "Faible", 2: "Moyen", 3: "Élevé"}
 CATALOG_CATEGORIES = {"Roulementier", "Visserie", "Joints élastomères"}
 
-# Pondérations du score de criticité (sur 100)
-W_RISK, W_COST, W_MASS, W_QTY = 0.4, 0.3, 0.2, 0.1
-REV_PENALTY, REV_PENALTY_CAP = 5, 15
+# Pondérations du score de criticité (sur 100), modifiables depuis l'application
+DEFAULT_WEIGHTS = {
+    "w_risk": 40, "w_cost": 30, "w_mass": 20, "w_qty": 10,       # parts (en %) des quatre critères de base
+    "rev_points": 5, "rev_cap": 15,                              # points par révision au-delà de A, plafond
+    "contract_points": 10, "contract_months": 6,                 # points si le contrat du fournisseur expire sous N mois
+    "esg_points": 5, "esg_floor": 60,                            # points si l'indice ESG du fournisseur est sous le seuil
+    "crit": 60, "watch": 35,                                     # seuils des niveaux
+}
+WEIGHT_LABELS = {
+    "w_risk": "Risque d'approvisionnement de la matière", "w_cost": "Part du coût estimé", "w_mass": "Part de la masse", "w_qty": "Nombre d'occurrences",
+    "rev_points": "Points par révision au-delà de A", "rev_cap": "Plafond des points de révision",
+    "contract_points": "Points si le contrat fournisseur expire bientôt", "contract_months": "Horizon d'expiration (mois)",
+    "esg_points": "Points si l'indice ESG du fournisseur est faible", "esg_floor": "Seuil ESG",
+    "crit": "Seuil « Critique »", "watch": "Seuil « À surveiller »",
+}
 
 
 def load_materials(path) -> pd.DataFrame:
@@ -32,9 +44,18 @@ def next_rev(rev: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-def part_risk(model: PlmModel, materials: pd.DataFrame) -> pd.DataFrame:
-    """Une ligne par référence de pièce : coût estimé, score de criticité, niveau."""
+def part_risk(model: PlmModel, materials: pd.DataFrame, weights: dict | None = None, suppliers: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Une ligne par référence de pièce : coût estimé, score de criticité, niveau.
+
+    ``weights`` : voir DEFAULT_WEIGHTS. ``suppliers`` : catalogue, pour le fournisseur principal et son contrat.
+    """
+    w = {**DEFAULT_WEIGHTS, **(weights or {})}
     p = model.parts().merge(materials, on="material", how="left")
+    if "cost_override" in model.bom.columns:
+        ov = model.bom.loc[model.bom["role"] == "part"].groupby("xml_id")["cost_override"].first()
+        p = p.merge(ov.rename("cost_override"), left_on="xml_id", right_index=True, how="left")
+    else:
+        p["cost_override"] = float("nan")
     p["price_eur_kg"] = p["price_eur_kg"].fillna(0)
     p["process_factor"] = p["process_factor"].fillna(1)
     p["supply_risk"] = p["supply_risk"].fillna(1).astype(int)
@@ -43,18 +64,34 @@ def part_risk(model: PlmModel, materials: pd.DataFrame) -> pd.DataFrame:
     p["kind"] = p["kind"].fillna("Fabriqué sur plan")
     p["family"] = p["family"].fillna("Inconnue")
     p["est_cost"] = (p["total_mass"] * p["price_eur_kg"] * p["process_factor"]).round(1)
+    p["est_cost"] = p["cost_override"].mul(p["qty"]).fillna(p["est_cost"]).round(1)
+    p["cost_source"] = p["cost_override"].notna().map({True: "Prix saisi", False: "Estimation matière"})
     p["co2_kg"] = (p["total_mass"] * p["co2_kg_per_kg"].fillna(0)).round(2)
 
-    rev_pen = ((p["rev_index"] - 1).clip(lower=0) * REV_PENALTY).clip(upper=REV_PENALTY_CAP)
-    score = 100 * (
-        W_RISK * (p["supply_risk"] - 1) / 2
-        + W_COST * p["est_cost"] / p["est_cost"].max()
-        + W_MASS * p["total_mass"] / p["total_mass"].max()
-        + W_QTY * p["qty"] / p["qty"].max()
+    # fournisseur principal et contrat
+    p["supplier"], p["contract_months_left"], p["supplier_esg"], p["contract_status"] = "", float("nan"), float("nan"), ""
+    if suppliers is not None and not suppliers.empty:
+        prim = suppliers.loc[suppliers["primary"]].drop_duplicates("supplier_category").set_index("supplier_category")
+        p["supplier"] = p["supplier_category"].map(prim["name"]).fillna("")
+        p["contract_months_left"] = p["supplier_category"].map(prim["months_left"])
+        p["supplier_esg"] = p["supplier_category"].map(prim["esg_index"])
+        p["contract_status"] = p["supplier_category"].map(prim["contract_status"]).fillna("")
+
+    rev_pen = ((p["rev_index"] - 1).clip(lower=0) * w["rev_points"]).clip(upper=w["rev_cap"])
+    contract_pen = ((p["contract_months_left"] <= w["contract_months"]) & p["contract_months_left"].notna()) * w["contract_points"]
+    esg_pen = ((p["supplier_esg"] < w["esg_floor"]) & p["supplier_esg"].notna()) * w["esg_points"]
+    base_total = max(1, w["w_risk"] + w["w_cost"] + w["w_mass"] + w["w_qty"])
+    score = 100 / base_total * (
+        w["w_risk"] * (p["supply_risk"] - 1) / 2
+        + w["w_cost"] * p["est_cost"] / max(p["est_cost"].max(), 1e-9)
+        + w["w_mass"] * p["total_mass"] / max(p["total_mass"].max(), 1e-9)
+        + w["w_qty"] * p["qty"] / max(p["qty"].max(), 1)
     )
-    p["score"] = (score + rev_pen).round().clip(upper=100).astype(int)
-    p["tier"] = pd.cut(p["score"], [-1, 34, 59, 100], labels=["Faible", "À surveiller", "Critique"]).astype(str)
+    p["score_base"] = score.round().astype(int)
+    p["score"] = (score + rev_pen + contract_pen + esg_pen).round().clip(upper=100).astype(int)
+    p["tier"] = pd.cut(p["score"], [-1, w["watch"] - 1, w["crit"] - 1, 100], labels=["Faible", "À surveiller", "Critique"]).astype(str)
     p["unstable"] = p["rev_index"] >= 3
+    p["origin"] = p["xml_id"].str.startswith("NEW_").map({True: "Ajout manuel", False: "XML"})
     return p.sort_values("score", ascending=False).reset_index(drop=True)
 
 

@@ -65,10 +65,10 @@ def _records(df: pd.DataFrame, cols: list[str], limit: int = 25) -> list[dict]:
 
 
 class Toolbox:
-    def __init__(self, model: PlmModel, materials: pd.DataFrame):
+    def __init__(self, model: PlmModel, materials: pd.DataFrame, risk: pd.DataFrame | None = None):
         self.m = model
         self.mats = materials
-        self.risk = analytics.part_risk(model, materials)
+        self.risk = risk if risk is not None else analytics.part_risk(model, materials)
 
     # -- définitions pour l'API ------------------------------------------------
     def definitions(self) -> list[dict]:
@@ -307,99 +307,204 @@ def _fmt_refs(refs: list[str]) -> str:
     return "\n\n**Sources**\n" + "\n".join(f"- {r}" for r in sorted(set(refs))[:12])
 
 
+# --- vocabulaire -------------------------------------------------------------
+_FAMILY_WORDS = {
+    "Aluminium": ["alu", "alluminium", "aluminium", "aluminum"], "Cuivre": ["cuivre", "copper", "bobinage", "fil émaillé"],
+    "Acier électrique": ["acier électrique", "tôle magnétique", "tole magnetique", "electrical steel", "m235"],
+    "Acier": ["acier", "steel", "20mncr5", "100cr6", "42crmo4", "16mncr5", "visserie", "vis "],
+    "Fonte": ["fonte", "cast iron"], "Élastomère": ["élastomère", "elastomere", "fkm", "joint"], "Polymère": ["polyamide", "plastique", "pa66", "polymère"],
+    "Magnésium": ["magnésium", "magnesium"],
+}
+_SUB_WORDS = {"EMOTOR FRONT": ["moteur", "emotor", "e-motor", "stator"], "REDUCER FRONT": ["réducteur", "reducteur", "reducer", "différentiel", "engrenage"],
+              "HOUSING FRONT EDRIVE": ["carter", "housing", "boîtier", "boitier"]}
+_PART_SYN = {"noyau du stator": "STATOR Core", "noyau stator": "STATOR Core", "carter gauche": "left housing", "carter droit": "right housing", "carter moteur": "motor", "support de transmission": "Transmission support",
+             "logement de roulement": "bearing housing", "noyau stator": "STATOR Core", "noyau du stator": "STATOR Core", "bobines": "STATOR Coils", "bobine": "STATOR Coil",
+             "arbre grande vitesse": "HSH", "arbre intermédiaire": "ISH", "roue dentée": "GEAR_WHEEL", "roues dentées": "GEAR_WHEEL", "pignon": "GEAR_WHEEL",
+             "roulement": "BEA", "roulements": "BEA", "vis": "Screw", "joint spi": "SPY joint", "joint": "SPY joint", "tuyau": "90 degrees pipe", "pipe": "90 degrees pipe",
+             "refroidissement": "MACHINE COOLING", "différentiel": "DIFFERENTIAL", "axe": "PIN", "plaque": "plate bearing motor", "dent": "STATOR Core Tooth"}
+_NEW_MAT_WORDS = {"magnésium": "Magnesium alloy AZ91D (HPDC)", "magnesium": "Magnesium alloy AZ91D (HPDC)", "aluminium recyclé": "Recycled aluminium AlSi9Cu3 (≥75 % secondary)",
+                  "recyclé": "Recycled aluminium AlSi9Cu3 (≥75 % secondary)", "fil aluminium": "Aluminium winding wire EC-Al (enamelled)", "hnbr": "HNBR elastomer (steel-reinforced)",
+                  "pa6": "Polyamide PA6-GF30", "18crnimo": "Case-hardening steel 18CrNiMo7-6", "16mncr5": "Case-hardening steel 16MnCr5", "alsi10mg": "Aluminium alloy EN AC-AlSi10Mg (cast)",
+                  "6082": "Aluminium alloy EN AW-6082-T6"}
+
+
+def _norm(q: str) -> str:
+    q = q.lower().replace("’", "'").replace("l'", "").replace("d'", "")
+    return re.sub(r"\s+", " ", q)
+
+
+def _find_family(q: str) -> str | None:
+    for fam, words in _FAMILY_WORDS.items():
+        if any(w in q for w in words):
+            return fam
+    return None
+
+
+def _find_sub(q: str) -> str | None:
+    for sub, words in _SUB_WORDS.items():
+        if any(w in q for w in words):
+            return sub
+    return None
+
+
+def _find_part(toolbox: Toolbox, q: str) -> list[str]:
+    """Noms courts des pièces reconnues dans la question (synonymes français puis noms exacts, puis approchant)."""
+    import difflib
+    hits = []
+    for fr, en in _PART_SYN.items():
+        if re.search(r"\b" + re.escape(fr) + r"\b", q):
+            hits.append(en)
+    shorts = toolbox.m.bom.loc[toolbox.m.bom["role"] != "geometry", "short"].unique().tolist()
+    for sname in shorts:
+        if sname.lower() in q and sname not in hits:
+            hits.append(sname)
+    if not hits:
+        words = [w for w in re.findall(r"[a-z0-9_]{4,}", q) if w not in _STOP]
+        for w in words:
+            close = difflib.get_close_matches(w, [x.lower() for x in shorts], n=1, cutoff=0.8)
+            if close:
+                hits.append(next(x for x in shorts if x.lower() == close[0]))
+    return sorted(hits, key=len, reverse=True)  # le nom le plus précis d'abord
+
+
+def _match_rows(toolbox: Toolbox, key: str):
+    b = toolbox.m.bom.loc[toolbox.m.bom["role"] != "geometry"]
+    exact = b.loc[b["short"].str.lower() == key.lower()]
+    return exact if not exact.empty else b.loc[b["short"].str.contains(re.escape(key), case=False)]
+
+
 def ask_offline(toolbox: Toolbox, question: str) -> tuple[str, list[ToolCall]]:
-    q = question.lower()
-    m = toolbox.m
+    """Routeur hors ligne : détecte l'intention et l'entité, appelle les outils, cite les sources."""
+    q = _norm(question)
+    fam, sub, parts = _find_family(q), _find_sub(q), _find_part(toolbox, q)
+    has = lambda *ws: any(w in q for w in ws)
+    risk = toolbox.risk
 
-    if any(w in q for w in ("critique", "risque", "critical", "danger", "fragile")):
-        sub = next((s for s in ("emotor", "reducer", "housing", "moteur", "réducteur", "carter") if s in q), "")
-        sub = {"moteur": "EMOTOR", "réducteur": "REDUCER", "carter": "HOUSING"}.get(sub, sub)
-        c = toolbox.run("critical_components", {"limit": 6, "subassembly": sub})
-        lines = [f"- **{r['short']}** (rév. {r['rev']}) · score {r['score']} · {r['tier']} · {r['material']} · {r['est_cost']} € est. {r['ref']}" for r in c.result["rows"]]
-        txt = "Composants les plus critiques" + (f" ({sub})" if sub else "") + " :\n" + "\n".join(lines) + \
-              f"\n\n*Formule : {c.result['formula']}. Coûts et risques = référentiel d'exemple.*"
-        return txt + _fmt_refs(c.refs), [c]
-
-    if any(w in q for w in ("impact", "rempla", "changer", "change", "substitu")):
-        mats = toolbox.mats["material"].tolist()
-        target = next((mt for mt in mats if mt.lower().split()[0] in q and mt.lower() != ""), None)
-        fam = next((f for f in ("magnésium", "magnesium", "aluminium recycl", "aluminium", "cuivre", "pa6", "hnbr") if f in q), None)
-        fam_map = {"magnésium": "Magnesium alloy AZ91D (HPDC)", "magnesium": "Magnesium alloy AZ91D (HPDC)",
-                   "aluminium recycl": "Recycled aluminium AlSi9Cu3 (≥75 % secondary)", "aluminium": "Aluminium alloy EN AC-AlSi9Cu3(Fe) (HPDC)",
-                   "cuivre": "Aluminium winding wire EC-Al (enamelled)", "pa6": "Polyamide PA6-GF30", "hnbr": "HNBR elastomer (steel-reinforced)"}
-        new_mat = fam_map.get(fam, target) or "Magnesium alloy AZ91D (HPDC)"
-        s = toolbox.run("search_components", {"query": _guess_part(q)})
-        rows = [r for r in s.result.get("rows", []) if r["role_label"].startswith("Pièce")]
-        if not rows:
-            return "Je n'ai pas reconnu la pièce. Précisez son nom (ex. « carter gauche », « left housing », « stator core »).", [s]
-        xml_id = rows[0]["xml_id"]
+    # 1. impact d'un changement de matière
+    if has("impact", "remplac", "substitu", "passe en", "passer en", "changer", "change ") and (parts or fam):
+        new_mat = next((m for w, m in _NEW_MAT_WORDS.items() if w in q), None)
+        if not new_mat:
+            new_mat = next((m for m in toolbox.mats["material"] if m.lower() in q), None)
+        if not parts:
+            return (f"Quelle pièce voulez-vous modifier ? Exemples : « impact si le carter gauche passe en magnésium », « remplacer le noyau stator par du 18CrNiMo ».", [])
+        rows = _match_rows(toolbox, parts[0])
+        rows = rows.loc[rows["role"] == "part"]
+        if rows.empty:
+            return (f"Je ne trouve pas la pièce « {parts[0]} ».", [])
+        xml_id = rows.iloc[0]["xml_id"]
+        if not new_mat:
+            cur = toolbox.mats.set_index("material").loc[rows.iloc[0]["material"], "family"] if rows.iloc[0]["material"] in set(toolbox.mats["material"]) else ""
+            alts = toolbox.mats.loc[(toolbox.mats["family"] == cur) & (~toolbox.mats["material"].isin(set(toolbox.m.bom["material"])))]["material"].tolist()
+            return (f"Vers quelle matière ? Pour **{rows.iloc[0]['short']}** ({rows.iloc[0]['material']}) le référentiel propose : " + ", ".join(alts or ["magnésium", "aluminium recyclé"]) + ".", [])
         c = toolbox.run("change_impact", {"xml_id": xml_id, "new_material": new_mat})
         r = c.result
         if "error" in r:
-            return f"Impossible de calculer : {r['error']}", [s, c]
+            return f"Impossible de calculer : {r['error']}", [c]
         sup = "fournisseur inchangé" if not r["supplier_change"] else f"changement de fournisseur : {r['supplier_from']} → {r['supplier_to']}"
         imp = "\n".join(f"- {x['short']} ({x['role_label']}) rév. {x['rev']} → {x['next_rev']} {x['ref']}" for x in r["impacted_objects"])
         txt = (f"**{r['part']}** {r['part_ref']} : {r['material_from']} → {r['material_to']} (volume constant)\n\n"
-               f"- Masse : {r['d_mass']:+.3f} kg ({r['d_mass_pct']:+.0%}) sur {r['qty']} occurrence(s)\n"
-               f"- Coût estimé : {r['d_cost']:+.1f} € ({r['d_cost_pct']:+.0%})\n"
-               f"- CO₂ matière : {r['d_co2']:+.1f} kg\n"
-               f"- Risque appro : {r['risk_from']} → {r['risk_to']} ; {sup}\n"
+               f"- Masse : {r['d_mass']:+.3f} kg ({r['d_mass_pct']:+.0%}) sur {r['qty']} occurrence(s)\n- Coût estimé : {r['d_cost']:+.1f} € ({r['d_cost_pct']:+.0%})\n"
+               f"- CO₂ matière : {r['d_co2']:+.1f} kg\n- Risque appro : {r['risk_from']} → {r['risk_to']} ; {sup}\n"
                + ("- ⚠ Changement de famille de matière : la géométrie doit être revue.\n" if r["family_change"] else "")
                + f"\nObjets PLM à réviser :\n{imp}\n\n*Hypothèses : {r['assumption']}.*")
-        return txt + _fmt_refs(c.refs), [s, c]
+        return txt + _fmt_refs(c.refs), [c]
 
-    if any(w in q for w in ("prix", "choc", "hausse", "augment", "+")):
-        fam = next((f for f, k in (("Aluminium", "alu"), ("Cuivre", "cuivre"), ("Acier électrique", "électrique"), ("Acier", "acier")) if k in q), "Aluminium")
-        pct = float(re.search(r"(\d+)\s*%", q).group(1)) if re.search(r"(\d+)\s*%", q) else 30
+    # 2. choc de prix
+    if has("choc", "hausse", "augment", "baisse", "renchér", "%") and fam:
+        m = re.search(r"([+-]?\d+)\s*%", q)
+        pct = float(m.group(1)) if m else 30.0
+        if has("baisse") and pct > 0:
+            pct = -pct
         c = toolbox.run("price_shock", {"family": fam, "pct": pct})
         r = c.result
-        lines = "\n".join(f"- {x['short']} : +{x['extra_cost']} € {x['ref']}" for x in r["rows"][:8])
+        lines = "\n".join(f"- {x['short']} : {x['extra_cost']:+.1f} € {x['ref']}" for x in r["rows"][:8])
         txt = f"Si le prix de la famille **{fam}** varie de **{pct:+.0f} %**, surcoût estimé **{r['total_extra_cost']:+.1f} €** par groupe motopropulseur ({r['share_of_total_cost']:.1%} du coût pièces estimé).\n\nPièces touchées :\n{lines}\n\n*{r['note']} Prix = référentiel d'exemple.*"
         return txt + _fmt_refs(c.refs), [c]
 
-    if any(w in q for w in ("matière", "matiere", "fournisseur", "material", "supplier")):
+    # 3. masse / coût / liste par famille ou matière
+    if fam and not parts and (has("poids", "masse", "kg", "pèse", "combien", "coût", "cout", "prix", "quelles pièces", "quels composants", "liste", "pièces en", "composants en") or len(q.split()) <= 6):
         c = toolbox.run("materials_and_suppliers", {})
-        bm = c.result["by_material"][:8]
-        bs = c.result["by_supplier"][:6]
-        txt = "Masse par matière :\n" + "\n".join(f"- {x['material']} : {x['mass']:.2f} kg · {x['cost']:.0f} € est. · risque {x['risk_label'].lower()}" for x in bm)
-        txt += "\n\nDépendances fournisseurs (part du coût estimé) :\n" + "\n".join(f"- {x['supplier_category']} ({x['kind']}) : {x['cost_share']:.0%} · risque max {x['risk_label'].lower()}" for x in bs)
-        txt += "\n\n*Masses et matières : champ Material et V_WCG_Mass de chaque Product du XML. Coûts, risques, fournisseurs : référentiel d'exemple.*"
+        bm = [x for x in c.result["by_material"] if x["family"] == fam]
+        parts_f = risk.loc[risk["family"] == fam].sort_values("total_mass", ascending=False)
+        if not bm:
+            return f"Aucune pièce en {fam} dans la nomenclature.", [c]
+        tot_m, tot_c = sum(x["mass"] for x in bm), sum(x["cost"] for x in bm)
+        txt = f"**{fam}** : **{tot_m:.2f} kg** sur {toolbox.m.bom.loc[toolbox.m.bom['level'] == 0, 'mass_kg'].iloc[0]:.1f} kg au total ({tot_m / toolbox.m.bom.loc[toolbox.m.bom['level'] == 0, 'mass_kg'].iloc[0]:.0%}), {len(parts_f)} références, coût estimé {tot_c:.0f} €.\n\nPar matière :\n"
+        txt += "\n".join(f"- {x['material']} : {x['mass']:.2f} kg · {x['cost']:.0f} € · risque {x['risk_label'].lower()}" for x in bm)
+        refs = [f"{r.xml_id} · L.{int(r.product_line)}" for r in parts_f.itertuples()]
+        txt += "\n\nPièces :\n" + "\n".join(f"- {r.short} (rév. {r.rev}) · {r.qty} × {r.unit_mass:.3f} kg = {r.total_mass:.2f} kg [{r.xml_id} · L.{int(r.product_line)}]" for r in parts_f.head(10).itertuples())
+        txt += "\n\n*Masses et matières : champs V_WCG_Mass et Material des objets Product. Coûts : référentiel d'exemple.*"
+        return txt + _fmt_refs(refs), [c]
+
+    # 4. criticité / risques
+    if has("critique", "risque", "critical", "fragile", "sensible", "surveiller"):
+        c = toolbox.run("critical_components", {"limit": 6, "subassembly": sub or ""})
+        lines = [f"- **{r['short']}** (rév. {r['rev']}) · score {r['score']} · {r['tier']} · {r['material']} · {r['est_cost']} € est. {r['ref']}" for r in c.result["rows"]]
+        txt = "Composants les plus critiques" + (f" ({sub})" if sub else "") + " :\n" + "\n".join(lines) + f"\n\n*Formule : {c.result['formula']}. Coûts et risques = référentiel d'exemple.*"
         return txt + _fmt_refs(c.refs), [c]
 
-    if any(w in q for w in ("qualité", "qualite", "anomal", "libér", "maturit", "doublon", "fiab")):
+    # 5. fiche d'une pièce (masse, matière, où utilisée, révision…)
+    if parts:
+        rows = _match_rows(toolbox, parts[0])
+        if not rows.empty:
+            if len(rows["xml_id"].unique()) > 1 and has("combien", "liste", "quels", "quelles", "où", "ou sont"):
+                c = toolbox.run("search_components", {"query": parts[0]})
+                rr = c.result["rows"]
+                txt = f"{c.result['matches']} occurrence(s) pour « {parts[0]} », masse cumulée {sum(x['mass_kg'] for x in rr):.2f} kg :\n" + "\n".join(
+                    f"- **{x['short']}** rév. {x['rev']} · {x['mass_kg']} kg · {x['material'] or '—'} · {x['path']} {x['ref']}" for x in rr[:12])
+                return txt + _fmt_refs(c.refs), [c]
+            c = toolbox.run("get_component", {"id": rows.iloc[0]["xml_id"]})
+            f = c.result["component"]
+            txt = (f"**{f['name']}** {f['ref']} · {f['role']}\n\n- Référence {f['part_number']} · révision {f['rev']} · {f['maturity']}\n- Matière : {f['material'] or '—'} · masse unitaire {f['mass_kg']} kg · {f['qty_in_product']} occurrence(s) → {f['mass_kg'] * f['qty_in_product']:.3f} kg\n"
+                   f"- Sous-ensemble : {f['subassembly']} · chemin : " + " › ".join(a["short"] for a in reversed(c.result["parents_to_root"])) + f" › {f['short']}\n")
+            if "criticality_score" in f:
+                txt += f"- Criticité {f['criticality_score']}/100 ({f['tier']}) · coût estimé {f['est_cost_eur (hypothèse)']} € · risque appro {f['supply_risk']} · fournisseur {f['supplier_category (hypothèse)']} *(hypothèses)*\n"
+            if c.result["children"]:
+                txt += "- Composants : " + ", ".join(x["short"] for x in c.result["children"][:12]) + "\n"
+            return txt + _fmt_refs(c.refs), [c]
+
+    # 6. matières et fournisseurs (général)
+    if has("matière", "matiere", "fournisseur", "material", "supplier", "dépendance"):
+        c = toolbox.run("materials_and_suppliers", {})
+        bm, bs = c.result["by_material"][:8], c.result["by_supplier"][:6]
+        txt = "Masse par matière :\n" + "\n".join(f"- {x['material']} : {x['mass']:.2f} kg · {x['cost']:.0f} € est. · risque {x['risk_label'].lower()}" for x in bm)
+        txt += "\n\nDépendances fournisseurs (part du coût estimé) :\n" + "\n".join(f"- {x['supplier_category']} ({x['kind']}) : {x['cost_share']:.0%} · risque max {x['risk_label'].lower()}" for x in bs)
+        txt += "\n\n*Masses et matières : XML. Coûts, risques, fournisseurs : référentiel d'exemple.*"
+        return txt + _fmt_refs(c.refs), [c]
+
+    # 7. qualité
+    if has("qualité", "qualite", "anomal", "libér", "maturit", "doublon", "fiab", "erreur"):
         c = toolbox.run("data_quality", {})
         txt = "Contrôles qualité de l'export :\n" + "\n".join(f"- **{x['level']}** · {x['title']} : {x['count']}" + (f" / {x['total']}" if 'total' in x else "") + f" — {x['text']}" for x in c.result["checks"])
         return txt + _fmt_refs(c.refs), [c]
 
-    if any(w in q for w in ("sous-ensemble", "sous ensemble", "structure", "composé", "compose", "vue d'ensemble", "overview", "masse totale", "combien")):
+    # 8. vue d'ensemble / sous-ensemble
+    if has("sous-ensemble", "sous ensemble", "structure", "composé", "compose", "ensemble", "overview", "masse totale", "poids total", "combien de") or sub:
         c = toolbox.run("bom_overview", {})
         r = c.result
-        subs = "\n".join(f"- **{s['short']}** rév. {s['rev']} · {s['mass_kg']} kg · {s['part_refs']} références / {s['part_occurrences']} occurrences {s['ref']}" for s in r["subassemblies"])
+        if sub:
+            s_ = next(x for x in r["subassemblies"] if x["short"] == sub)
+            occ_rows = toolbox.m.bom.loc[(toolbox.m.bom["subassembly"] == sub) & (toolbox.m.bom["role"] == "part")]
+            txt = f"**{sub}** rév. {s_['rev']} · {s_['mass_kg']} kg · {s_['part_refs']} références / {s_['part_occurrences']} occurrences {s_['ref']}\n\nPrincipales pièces :\n" + "\n".join(
+                f"- {x.short} · {x.mass_kg} kg · {x.material or '—'} [{x.xml_id} · L.{int(x.product_line)}]" for x in occ_rows.drop_duplicates("xml_id").sort_values("mass_kg", ascending=False).head(10).itertuples())
+            return txt + _fmt_refs(c.refs), [c]
+        subs = "\n".join(f"- **{s_['short']}** rév. {s_['rev']} · {s_['mass_kg']} kg · {s_['part_refs']} références / {s_['part_occurrences']} occurrences {s_['ref']}" for s_ in r["subassemblies"])
         k = r["kpis"]
         txt = (f"**{r['root']['short']}** rév. {r['root']['rev']}, {r['root']['mass_kg']} kg, {r['root']['maturity']} {r['root']['ref']}\n\nSous-ensembles :\n{subs}\n\n"
                f"{int(k['part_refs'])} références de pièces, {int(k['part_occ'])} occurrences, {int(k['materials'])} matières, {k['released_pct']:.0%} d'objets libérés.")
         return txt + _fmt_refs(c.refs), [c]
 
-    # par défaut : recherche
-    c = toolbox.run("search_components", {"query": _guess_part(q)})
+    # 9. recherche libre
+    key = " ".join(w for w in re.findall(r"[a-z0-9_]{3,}", q) if w not in _STOP)[:40]
+    c = toolbox.run("search_components", {"query": key})
     rows = c.result.get("rows", [])
     if not rows:
-        return ("Je n'ai rien trouvé. Essayez : « quels sont les sous-ensembles ? », « composants critiques du réducteur », "
-                "« impact si le carter gauche passe en magnésium », « +30 % sur l'aluminium », « qualité des données »."), [c]
-    lines = "\n".join(f"- **{r['short']}** ({r['role_label']}) rév. {r['rev']} · {r['maturity']} · {r['mass_kg']} kg · {r['material'] or '—'} · {r['path']} {r['ref']}" for r in rows[:10])
-    return f"{c.result['matches']} occurrence(s) trouvée(s) pour « {c.args['query']} » :\n{lines}" + _fmt_refs(c.refs), [c]
+        return ("Je n'ai pas compris la question. Je sais répondre sur : la structure (« quels sont les sous-ensembles ? »), une pièce (« fiche du carter gauche »), "
+                "une matière (« quel est le poids de l'aluminium ? »), la criticité (« composants critiques du réducteur »), un changement (« impact si le carter gauche passe en magnésium »), "
+                "un choc de prix (« +30 % sur le cuivre »), les fournisseurs et la qualité des données."), [c]
+    lines = "\n".join(f"- **{r['short']}** ({r['role_label']}) rév. {r['rev']} · {r['mass_kg']} kg · {r['material'] or '—'} · {r['path']} {r['ref']}" for r in rows[:10])
+    return f"{c.result['matches']} occurrence(s) trouvée(s) pour « {key} » :\n{lines}" + _fmt_refs(c.refs), [c]
 
 
-_STOP = {"le", "la", "les", "de", "du", "des", "un", "une", "si", "en", "au", "aux", "et", "ou", "quel", "quelle", "quels", "quelles", "est", "sont",
-         "impact", "remplace", "remplacer", "changer", "change", "par", "passe", "passer", "on", "je", "pièce", "piece", "composant", "cherche", "trouve",
-         "magnésium", "magnesium", "aluminium", "cuivre", "acier", "recyclé", "matière", "que", "qui", "pour", "dans", "avec", "info", "sur", "détail", "fiche"}
-_SYN = {"carter gauche": "left housing", "carter droit": "right housing", "carter": "housing", "stator": "stator", "bobinage": "coils", "roulement": "BEA",
-        "vis": "screw", "roue dentée": "gear", "engrenage": "gear", "arbre": "SH", "différentiel": "differential", "joint": "joint", "refroidissement": "cooling"}
-
-
-def _guess_part(q: str) -> str:
-    for fr, en in _SYN.items():
-        if fr in q:
-            return en
-    words = [w for w in re.findall(r"[a-zA-Zéèêàç0-9_]+", q) if w not in _STOP and len(w) > 2]
-    return " ".join(words[:2]) if words else q
+_STOP = {"le", "la", "les", "de", "du", "des", "un", "une", "si", "en", "au", "aux", "et", "ou", "quel", "quelle", "quels", "quelles", "est", "sont", "que", "qui", "pour",
+         "dans", "avec", "sur", "poids", "masse", "combien", "donne", "moi", "info", "fiche", "détail", "detail", "pièce", "piece", "composant", "cherche", "trouve", "liste", "sous"}

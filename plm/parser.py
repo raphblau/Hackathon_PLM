@@ -68,6 +68,7 @@ class PlmModel:
                 material=("material", "first"), unit_mass=("mass_kg", "first"),
                 subassembly=("subassembly", "first"), product_line=("product_line", "first"),
                 description=("description", "first"), qty=("occ", "count"),
+                part_number_line=("xml_line", "first"),
             )
             .reset_index()
         )
