@@ -5,19 +5,23 @@ Lancer :  streamlit run app.py
 from __future__ import annotations
 
 import html
+import json
 import os
+import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from plm import analytics, assistant, parser
+from plm import analytics, assistant, extras, icons, parser
 
 ROOT = Path(__file__).parent
 XML_PATH = ROOT / "data" / "XPDMXML_ECAR_PLM.xml"
 MAT_PATH = ROOT / "data" / "materials_ref.csv"
+SUP_PATH = ROOT / "data" / "suppliers.csv"
 
 C_BLUE, C_MUTED, C_BAD, C_WARN, C_OK = "#1f6feb", "#b7c4d9", "#d13438", "#c77d00", "#1a9c5b"
 SUB_COLORS = {"EMOTOR FRONT": "#1f6feb", "REDUCER FRONT": "#7a5af8", "HOUSING FRONT EDRIVE": "#0f9d8a"}
@@ -100,8 +104,9 @@ def kpi(col, label, value, sub="", sample=False, unit=""):
 
 
 def plotly_base(fig: go.Figure, height=320) -> go.Figure:
+    top = fig.layout.margin.t if fig.layout.margin and fig.layout.margin.t else 8
     fig.update_layout(
-        height=height, margin=dict(l=8, r=8, t=8, b=8), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=height, margin=dict(l=8, r=8, t=top, b=8), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Segoe UI, Helvetica Neue, Arial", size=12, color="#1c2430"),
         hoverlabel=dict(bgcolor="#fff", bordercolor="#d7dee8", font=dict(color="#1c2430")),
         legend=dict(orientation="h", y=-0.14, x=0, font=dict(size=11)),
@@ -123,7 +128,13 @@ def room(fig: go.Figure, values, axis="x", factor=1.22) -> go.Figure:
 # ---------------------------------------------------------------------------
 if "xml_upload" not in st.session_state:
     st.session_state.xml_upload = None
-MODEL, MATS, RISK, XML_LINES = load_all(st.session_state.xml_upload)
+BASE_MODEL, MATS, _, XML_LINES = load_all(st.session_state.xml_upload)
+SUPPLIERS = extras.load_suppliers(SUP_PATH)
+st.session_state.setdefault("weights", dict(analytics.DEFAULT_WEIGHTS))
+st.session_state.setdefault("additions", [])
+st.session_state.setdefault("risks_manual", [])
+MODEL = extras.apply_additions(BASE_MODEL, st.session_state.additions)
+RISK = analytics.part_risk(MODEL, MATS, st.session_state.weights, SUPPLIERS)
 BOM = MODEL.bom
 KPI = analytics.kpis(MODEL, RISK)
 SUBS = ["Tous"] + BOM.loc[BOM["level"] == 1, "short"].tolist()
@@ -234,7 +245,9 @@ def page_explorer():
         crumbs = " › ".join(html.escape(a["short"]) for a in reversed(anc))
         widget_open("Propriétés du composant")
         st.markdown(f'<div class="plm-crumbs">{crumbs} › <b>{html.escape(r["short"])}</b></div>', unsafe_allow_html=True)
-        st.markdown(f"**{html.escape(r['name'])}** &nbsp; {chip(r['role_label'], 'fill')} {chip(r['maturity'], 'warn' if r['maturity'] != 'RELEASED' else 'ok')}", unsafe_allow_html=True)
+        ic, tx = st.columns([1, 4])
+        ic.markdown(icons.svg(r["short"], r["role"], 88), unsafe_allow_html=True)
+        tx.markdown(f"**{html.escape(r['name'])}**<br>{chip(r['role_label'], 'fill')} {chip(r['maturity'], 'warn' if r['maturity'] != 'RELEASED' else 'ok')} {chip(icons.LABEL[icons.kind_of(r['short'], r['role'])], 'info')}<br><span style='font-size:.72rem;color:#8a97ab'>Pictogramme illustratif : l'export ne contient pas la géométrie 3D.</span>", unsafe_allow_html=True)
         used = MODEL.where_used(r["xml_id"])
         rk = RISK.loc[RISK["xml_id"] == r["xml_id"]]
         props = [
@@ -245,16 +258,20 @@ def page_explorer():
         ]
         if not rk.empty:
             k = rk.iloc[0]
-            props += [("Coût estimé*", fmt_eur(k["est_cost"])), ("Risque appro*", k["risk_label"]), ("Fournisseur*", k["supplier_category"]),
+            props += [("Coût estimé*", f"{fmt_eur(k['est_cost'])} ({k['cost_source'].lower()})"), ("Risque appro*", k["risk_label"]),
+                      ("Fournisseur*", f"{k['supplier'] or '—'} · {k['supplier_category']}" + (f" · contrat : {k['contract_status'].lower()}" if k["contract_status"] else "")),
                       ("Criticité*", f"{k['score']} / 100 · {k['tier']}")]
         st.markdown('<div class="plm-props">' + "".join(f'<div class="k">{html.escape(a)}</div><div class="v">{html.escape(str(b))}</div>' for a, b in props) + "</div>", unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="plm-src">Source : objet Product <code>{r["xml_id"]}</code> ligne {r["product_line"]} · instance <code>{r["inst"]}</code> ligne {r["xml_line"]} du fichier {html.escape(MODEL.source_name)}.'
-            + (" &nbsp;* hypothèses du référentiel matières." if not rk.empty else "") + "</div>", unsafe_allow_html=True)
-        with st.expander("Voir la source XML"):
-            st.code(xml_snippet(XML_LINES, int(r["product_line"])), language="xml")
-            if r["inst"] != "ROOT":
-                st.code(xml_snippet(XML_LINES, int(r["xml_line"]), 20), language="xml")
+        if r.get("origin") == "Ajout manuel":
+            st.markdown('<div class="plm-src">Source : <b>saisie utilisateur</b> (page « Mise à jour de la nomenclature »), absent de l\'export OEM.' + (" &nbsp;* hypothèses du référentiel matières." if not rk.empty else "") + "</div>", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                f'<div class="plm-src">Source : objet Product <code>{r["xml_id"]}</code> ligne {r["product_line"]} · instance <code>{r["inst"]}</code> ligne {r["xml_line"]} du fichier {html.escape(MODEL.source_name)}.'
+                + (" &nbsp;* hypothèses du référentiel matières." if not rk.empty else "") + "</div>", unsafe_allow_html=True)
+            with st.expander("Voir la source XML"):
+                st.code(xml_snippet(XML_LINES, int(r["product_line"])), language="xml")
+                if r["inst"] != "ROOT":
+                    st.code(xml_snippet(XML_LINES, int(r["xml_line"]), 20), language="xml")
         if r["role"] == "part":
             st.button("Évaluer un changement de matière", on_click=goto_impact, args=(r["xml_id"],), type="primary", width="stretch")
         widget_close()
@@ -329,12 +346,16 @@ def page_intelligence():
         st.plotly_chart(plotly_base(fig, 380), width="stretch", config={"displayModeBar": False})
         widget_close()
 
+    w = st.session_state.weights
+    tot = max(1, w["w_risk"] + w["w_cost"] + w["w_mass"] + w["w_qty"])
     widget_open("Criticité des composants",
-                "Score sur 100 : 40 % risque d'approvisionnement de la matière, 30 % part du coût, 20 % part de la masse, 10 % occurrences, +5 points par révision au-delà de A (max +15). Critique ≥ 60, à surveiller ≥ 35.")
-    view = r[["short", "rev", "subassembly", "material", "qty", "total_mass", "est_cost", "risk_label", "supplier_category", "kind", "score", "tier", "xml_id"]].copy()
+                f"Score sur 100 : {w['w_risk'] / tot:.0%} risque matière, {w['w_cost'] / tot:.0%} coût, {w['w_mass'] / tot:.0%} masse, {w['w_qty'] / tot:.0%} occurrences ; "
+                f"+{w['rev_points']} pts par révision au-delà de A (max +{w['rev_cap']}), +{w['contract_points']} pts si le contrat fournisseur expire sous {w['contract_months']} mois, "
+                f"+{w['esg_points']} pts si ESG fournisseur < {w['esg_floor']}. Critique ≥ {w['crit']}, à surveiller ≥ {w['watch']}. Modifiable dans « Paramètres de criticité ».")
+    view = r[["short", "rev", "subassembly", "material", "qty", "total_mass", "est_cost", "risk_label", "supplier", "contract_status", "kind", "score", "tier", "xml_id"]].copy()
     view["rev"] = view.apply(lambda x: f"{x['rev']} ⚠" if x["rev"] >= "C" else x["rev"], axis=1)
     view = view.rename(columns={"short": "Composant", "rev": "Rév.", "subassembly": "Sous-ensemble", "material": "Matière", "qty": "Qté", "total_mass": "Masse (kg)",
-                                "est_cost": "Coût est. (€)", "risk_label": "Risque appro", "supplier_category": "Fournisseur (cat.)", "kind": "Type", "score": "Score", "tier": "Niveau"})
+                                "est_cost": "Coût est. (€)", "risk_label": "Risque appro", "supplier": "Fournisseur", "contract_status": "Contrat", "kind": "Type", "score": "Score", "tier": "Niveau"})
     ev = st.dataframe(view, hide_index=True, width="stretch", height=420, on_select="rerun", selection_mode="single-row", key="risk_table",
                       column_config={"xml_id": None, "Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
                                      "Masse (kg)": st.column_config.NumberColumn(format="%.2f"), "Coût est. (€)": st.column_config.NumberColumn(format="%.0f")})
@@ -348,6 +369,7 @@ def page_intelligence():
         widget_open("Choc de prix matière", "Que se passe-t-il si une famille de matières renchérit ? Le choc s'applique à la part matière du coût (coût ÷ facteur procédé).")
         fam = st.selectbox("Famille", sorted(MATS["family"].unique()), index=sorted(MATS["family"].unique()).index("Aluminium"))
         pct = st.slider("Variation du prix", -50, 100, 30, 5, format="%+d %%")
+        fam_label = fam
         ps = analytics.price_shock(r, fam, pct)
         total = ps["extra_cost"].sum()
         m1, m2 = st.columns(2)
@@ -367,10 +389,60 @@ def page_intelligence():
             st.plotly_chart(plotly_base(fig, 300), width="stretch", config={"displayModeBar": False})
         widget_close()
 
-    widget_open("Dépendances fournisseurs", "Catégories déduites de la matière et du procédé (hypothèse). Une catégorie à risque élevé qui porte une grosse part du coût est une dépendance à sécuriser.")
-    sv = bs.rename(columns={"supplier_category": "Catégorie de fournisseur", "kind": "Type", "refs": "Réf.", "qty": "Pièces", "mass": "Masse (kg)", "cost": "Coût est. (€)", "cost_share": "Part du coût", "risk_label": "Risque max"}).drop(columns="risk")
-    st.dataframe(sv, hide_index=True, width="stretch", column_config={"Part du coût": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"),
-                                                                       "Masse (kg)": st.column_config.NumberColumn(format="%.2f"), "Coût est. (€)": st.column_config.NumberColumn(format="%.0f")})
+    widget_open("Concentration des achats par fournisseur",
+                "À quoi sert ce tableau : savoir chez qui l'argent et le risque sont concentrés. Chaque pièce est rattachée au fournisseur principal de sa catégorie (catalogue data/suppliers.csv). "
+                "Une ligne avec une forte part du coût, un contrat qui expire et pas de seconde source est une dépendance à traiter en priorité (voir « Risques & couverture »).")
+    alt = SUPPLIERS.loc[~SUPPLIERS["primary"]].groupby("supplier_category")["name"].apply(lambda x: ", ".join(x))
+    g = r.groupby(["supplier", "supplier_category", "kind"], as_index=False).agg(refs=("xml_id", "count"), qty=("qty", "sum"), cost=("est_cost", "sum"), risk=("supply_risk", "max"), crit=("tier", lambda t: int((t == "Critique").sum())))
+    g["cost_share"] = g["cost"] / r["est_cost"].sum()
+    g["Seconde source"] = g["supplier_category"].map(alt).fillna("aucune")
+    g["Contrat"] = g["supplier"].map(SUPPLIERS.set_index("name")["contract_status"]).fillna("—")
+    g["risk_label"] = g["risk"].map(analytics.RISK_LABEL)
+    g["Priorité"] = ((g["cost_share"] > 0.1).astype(int) + g["Contrat"].str.startswith("Expire").astype(int) + (g["Seconde source"] == "aucune").astype(int) + (g["risk"] == 3).astype(int)).map({0: "—", 1: "Basse", 2: "Moyenne", 3: "Haute", 4: "Haute"})
+    g = g.sort_values("cost", ascending=False)
+    sv = g.rename(columns={"supplier": "Fournisseur", "supplier_category": "Catégorie", "kind": "Type", "refs": "Réf.", "qty": "Pièces", "cost": "Coût est. (€)", "cost_share": "Part du coût", "risk_label": "Risque matière", "crit": "Pièces critiques"}).drop(columns=["risk"])
+    st.dataframe(sv[["Fournisseur", "Catégorie", "Type", "Réf.", "Pièces", "Coût est. (€)", "Part du coût", "Pièces critiques", "Risque matière", "Contrat", "Seconde source", "Priorité"]], hide_index=True, width="stretch",
+                 column_config={"Part du coût": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"), "Coût est. (€)": st.column_config.NumberColumn(format="%.0f")})
+    st.caption("Priorité = nombre de signaux parmi : part du coût > 10 %, contrat qui expire, pas de seconde source, matière à risque élevé.")
+    widget_close()
+
+    # ---- Marché matières (simulation) -----------------------------------------
+    st.markdown('<p class="plm-eyebrow" style="margin-top:8px">Marché matières · simulation</p>', unsafe_allow_html=True)
+    series = extras.price_series(MATS, shock={fam: pct} if pct else None)
+    ev26, ev27 = extras.cost_evolution(r, series, 2026), extras.cost_evolution(r, series, 2027)
+    a, b, d = st.columns([4, 4, 4], gap="medium")
+    with a:
+        widget_open("Décomposition du coût par famille", "Part de chaque famille de matière dans le coût pièces estimé.")
+        fam = r.groupby("family")["est_cost"].sum().sort_values(ascending=False).reset_index()
+        fig = px.pie(fam, names="family", values="est_cost", hole=0.55, color_discrete_sequence=["#1f6feb", "#7a5af8", "#0f9d8a", "#c77d00", "#d13438", "#5d6b7e", "#2f9e44", "#e8590c"])
+        fig.update_traces(textinfo="percent", textposition="inside", textfont_size=11, hovertemplate="<b>%{label}</b><br>%{value:.0f} € · %{percent}<extra></extra>", marker=dict(line=dict(color="#fff", width=1.5)))
+        fig.update_layout(legend=dict(orientation="v", y=0.5, x=1.02, font=dict(size=11)), margin=dict(l=0, r=0, t=0, b=0))
+        st.plotly_chart(plotly_base(fig, 280), width="stretch", config={"displayModeBar": False})
+        widget_close()
+    with b:
+        widget_open("Évolution du coût matière", "Variation du coût matière du produit entre janvier et décembre, d'après l'indice simulé par famille.")
+        delta_tile(st, "Janvier → décembre 2026 (historique simulé)", f"{ev26:+.1f} €", "", good=ev26 <= 0, sub="par groupe motopropulseur")
+        st.write("")
+        delta_tile(st, "Janvier → décembre 2027 (prévision simulée)", f"{ev27:+.1f} €", "", good=ev27 <= 0, sub=f"avec le choc {fam_label} {pct:+d} %" if pct else "sans choc")
+        widget_close()
+    with d:
+        widget_open("Exposition matière par famille", "Part matière du coût (coût ÷ facteur procédé) : ce qui est réellement exposé aux marchés.")
+        ex = (r["est_cost"] / r["process_factor"].replace(0, 1)).groupby(r["family"]).sum().sort_values().reset_index(name="exposure")
+        fig = px.bar(ex, x="exposure", y="family", orientation="h", text=ex["exposure"].map(lambda v: f"{v:.0f} €"), color_discrete_sequence=[C_BLUE])
+        fig.update_traces(textposition="outside", marker_line_width=0)
+        fig.update_layout(xaxis_title=None, yaxis_title=None, showlegend=False)
+        room(fig, ex["exposure"], factor=1.3)
+        st.plotly_chart(plotly_base(fig, 280), width="stretch", config={"displayModeBar": False})
+        widget_close()
+    widget_open("Prévision des indices de prix matière", f"Base 100 = aujourd'hui. Trait plein : historique simulé ; pointillé : prévision simulée (dérive et volatilité par famille, hypothèses d'exemple). Le choc {fam_label} {pct:+d} % s'applique à la prévision.")
+    fams = st.multiselect("Familles", sorted(series["family"].unique()), default=["Aluminium", "Cuivre", "Acier électrique", "Acier"], label_visibility="collapsed")
+    sel = series.loc[series["family"].isin(fams)]
+    fig = px.line(sel, x="month", y="index", color="family", line_dash="kind", line_dash_map={"Historique (simulé)": "solid", "Prévision (simulée)": "dot"}, markers=True,
+                  color_discrete_sequence=["#1f6feb", "#d13438", "#7a5af8", "#0f9d8a", "#c77d00", "#5d6b7e", "#2f9e44", "#e8590c"])
+    fig.add_vline(x=pd.Timestamp(extras.TODAY).replace(day=1).timestamp() * 1000, line_dash="dash", line_color="#1c2430")
+    fig.update_traces(marker_size=5, line_width=2)
+    fig.update_layout(xaxis_title=None, yaxis_title="Indice (base 100)", legend_title=None)
+    st.plotly_chart(plotly_base(fig, 340), width="stretch", config={"displayModeBar": False})
     widget_close()
 
 
@@ -394,7 +466,9 @@ def page_impact():
         st.error(str(e))
         return
     p, a, b = ci["part"], ci["from"], ci["to"]
-    st.markdown(f"Matière actuelle : **{html.escape(a['material'])}** ({a['family']}) · fournisseur actuel : {html.escape(a['supplier_category'])} · {ci['qty']} occurrence(s) · masse unitaire {fmt_kg(ci['old_unit_mass'])} kg → {fmt_kg(ci['new_unit_mass'])} kg", unsafe_allow_html=True)
+    ic, tx = st.columns([1, 11])
+    ic.markdown(icons.svg(p["short"], "part", 64), unsafe_allow_html=True)
+    tx.markdown(f"**{html.escape(p['short'])}** · {icons.LABEL[icons.kind_of(p['short'])]} (pictogramme illustratif)<br>Matière actuelle : **{html.escape(a['material'])}** ({a['family']}) · fournisseur actuel : {html.escape(a['supplier_category'])} · {ci['qty']} occurrence(s) · masse unitaire {fmt_kg(ci['old_unit_mass'])} kg → {fmt_kg(ci['new_unit_mass'])} kg", unsafe_allow_html=True)
 
     c = st.columns(5)
     delta_tile(c[0], "Masse (toutes occurrences)", f"{ci['d_mass']:+.2f} kg", f"{ci['d_mass_pct']:+.0%}", good=ci["d_mass"] < 0, sub="sur la pièce")
@@ -410,6 +484,45 @@ def page_impact():
         st.success(f"Même catégorie de fournisseur ({a['supplier_category']}) : le changement peut probablement rester chez le fournisseur actuel, sous réserve de requalification.")
     if ci["family_change"]:
         st.warning(f"**Changement de famille de matière** ({a['family']} → {b['family']}) : le calcul à volume constant ne suffit pas, la géométrie doit être revue par le bureau d'études.")
+
+    widget_open("Schéma de dépendance : qui et quoi est touché", "De gauche à droite : la matière et le fournisseur actuels, la pièce modifiée, les assemblages qui la contiennent jusqu'au produit, puis les acteurs qui doivent intervenir. L'épaisseur des flux suit le coût estimé.")
+    imp = ci["impacted"].sort_values("level", ascending=False)
+    chain = [x for x in imp.itertuples()]  # pièce → … → racine
+    short_m = lambda m: re.sub(r"\s*\(.*?\)", "", m)
+    labels = [f"Matière actuelle\n{short_m(a['material'])}", f"Nouvelle matière\n{short_m(b['material'])}", f"Fournisseur actuel\n{a['supplier_category']}", f"Nouveau fournisseur\n{b['supplier_category']}"]
+    xs, ys = [0.01] * 4, [0.12, 0.38, 0.64, 0.9]
+    node_color = ["#8a97ab", C_WARN, "#8a97ab", C_BAD if ci["supplier_change"] else C_OK]
+    for i, x in enumerate(chain):
+        labels.append(f"{x.short}\nrév. {x.rev} → {x.next_rev}")
+        node_color.append(C_BLUE if x.role_label.startswith("Pièce") else SUB_COLORS.get(x.short, "#7a5af8") if x.level == 1 else "#1c2430")
+        xs.append(0.26 + 0.42 * i / max(len(chain) - 1, 1)); ys.append(0.5)
+    actors = [("Bureau d'études", "revoir la géométrie" if ci["family_change"] else "valider à volume constant", True),
+              ("Achats", f"consulter {b['supplier_category']}" if ci["supplier_change"] else "avenant prix/qualité", True),
+              ("Qualité", "requalification pièce + PPAP", True), ("Client OEM", "demande de modification (ECR) sur " + chain[-1].short, True),
+              ("Logistique", "stock de transition", ci["supplier_change"])]
+    actors = [x for x in actors if x[2]]
+    for j, (name, why, _) in enumerate(actors):
+        labels.append(name)
+        node_color.append("#0f9d8a")
+        xs.append(0.99); ys.append((j + 0.5) / len(actors))
+    cost_w = max(abs(float(p["est_cost"])), 1.0)
+    src, dst, val, lcol = [], [], [], []
+    part_idx = 4
+    src += [0, 1, 2, 3]; dst += [part_idx] * 4; val += [cost_w, cost_w + abs(ci["d_cost"]), cost_w, cost_w + abs(ci["d_cost"])]
+    lcol += ["rgba(138,151,171,.35)", "rgba(199,125,0,.45)", "rgba(138,151,171,.35)", "rgba(209,52,56,.4)" if ci["supplier_change"] else "rgba(26,156,91,.4)"]
+    for i in range(len(chain) - 1):
+        src.append(part_idx + i); dst.append(part_idx + i + 1); val.append(cost_w * 2); lcol.append("rgba(31,111,235,.35)")
+    root_idx = part_idx + len(chain) - 1
+    for j in range(len(actors)):
+        src.append(root_idx); dst.append(root_idx + 1 + j); val.append(cost_w * 2 / len(actors)); lcol.append("rgba(15,157,138,.35)")
+    fig = go.Figure(go.Sankey(arrangement="fixed", node=dict(label=[x.replace("\n", "<br>") for x in labels], x=xs, y=ys, color=node_color, pad=24, thickness=14, line=dict(color="#fff", width=1)),
+                              link=dict(source=src, target=dst, value=val, color=lcol)))
+    fig.update_layout(font=dict(size=11), margin=dict(l=10, r=10, t=20, b=20))
+    st.plotly_chart(plotly_base(fig, 420), width="stretch", config={"displayModeBar": False})
+    cols = st.columns(len(actors))
+    for col, (name, why, _) in zip(cols, actors):
+        kpi(col, "Acteur impacté", name, why)
+    widget_close()
 
     l, r_ = st.columns([7, 5], gap="medium")
     with l:
@@ -486,7 +599,7 @@ SUGGESTIONS = [
 
 def page_assistant():
     topbar("Assistant PLM", "Interrogez la nomenclature en langage naturel ; chaque réponse cite les objets XML consultés")
-    tb = assistant.Toolbox(MODEL, MATS)
+    tb = assistant.Toolbox(MODEL, MATS, RISK)
     online = assistant.has_api_key()
     if online:
         st.caption(f"Mode Claude ({assistant.MODEL_ID}) : le modèle choisit les outils à appeler, les résultats portent leurs références XML.")
@@ -535,6 +648,335 @@ def page_assistant():
         st.rerun()
 
 
+
+# ---------------------------------------------------------------------------
+# Page : Fournisseurs (catalogue, contrats, performance)
+# ---------------------------------------------------------------------------
+def stars(n: int) -> str:
+    return "★" * int(n) + "☆" * (5 - int(n))
+
+
+def page_suppliers():
+    topbar("Fournisseurs", "Catalogue, contrats et performance du réseau de fournisseurs (données du fournisseur, pas de l'OEM)")
+    prim = SUPPLIERS.loc[SUPPLIERS["primary"]]
+    exp = prim.loc[prim["contract_status"].isin(["Expiré", "Expire < 3 mois", "Expire < 6 mois"])]
+    c = st.columns(5)
+    kpi(c[0], "Fournisseurs au catalogue", len(SUPPLIERS), f"{len(prim)} principaux · {len(SUPPLIERS) - len(prim)} alternatifs")
+    kpi(c[1], "Contrats à renouveler", len(exp), "échéance sous 6 mois", sample=len(exp) > 0)
+    kpi(c[2], "Indice ESG moyen", f"{prim['esg_index'].mean():.0f}", "fournisseurs principaux, sur 100")
+    kpi(c[3], "Délai de réponse moyen", f"{prim['answer_time_days'].mean():.1f}", "jours (RFQ)", unit=" j")
+    kpi(c[4], "Catégories sans seconde source", int((SUPPLIERS.groupby("supplier_category")["supplier_id"].count() == 1).sum()), f"sur {SUPPLIERS['supplier_category'].nunique()} catégories", sample=True)
+    st.write("")
+
+    left, right = st.columns([3, 9], gap="medium")
+    with left:
+        widget_open("Catalogue")
+        names = SUPPLIERS["name"].tolist()
+        sel = st.radio("Fournisseur", names, index=names.index(st.session_state.get("sel_supplier", names[0])) if st.session_state.get("sel_supplier") in names else 0,
+                       format_func=lambda n: f"{n} · {stars(SUPPLIERS.set_index('name').loc[n, 'rating'])}", label_visibility="collapsed")
+        st.session_state.sel_supplier = sel
+        widget_close()
+    with right:
+        s = SUPPLIERS.set_index("name").loc[sel]
+        parts_s = RISK.loc[RISK["supplier_category"] == s["supplier_category"]] if s["primary"] else RISK.iloc[0:0]
+        widget_open(f"{sel}", f"{s['supplier_category']} · {s['city']}, {s['country']} · {s['note']}")
+        a, b, d, e = st.columns(4)
+        kpi(a, "Note", stars(s["rating"]), f"{s['rating']}/5")
+        kpi(b, "Indice ESG", int(s["esg_index"]), "sur 100", sample=s["esg_index"] < st.session_state.weights["esg_floor"])
+        kpi(d, "Délai de réponse", int(s["answer_time_days"]), "jours", unit=" j")
+        st_chip = {"En cours": "ok", "Expire < 6 mois": "warn", "Expire < 3 mois": "bad", "Expiré": "bad", "Sans contrat": "info"}[s["contract_status"]]
+        kpi(e, "Contrat", chip(s["contract_status"], st_chip), f"{s['contract_type']}" + (f" · fin {s['contract_end']:%d/%m/%Y}" if pd.notna(s["contract_end"]) else ""))
+        widget_close()
+
+        tabs = st.tabs(["Pièces nominées", "Contrat", "Performance du réseau", "Sites"])
+        with tabs[0]:
+            if parts_s.empty:
+                st.info("Fournisseur alternatif : aucune pièce ne lui est attribuée aujourd'hui. Voir « Risques & couverture » pour le proposer en seconde source.")
+            else:
+                v = parts_s[["short", "part_number", "rev", "material", "qty", "est_cost", "cost_source", "score", "tier"]].copy()
+                v["Capacité"] = s["capacity_pct"] / 100
+                v = v.rename(columns={"short": "Pièce", "part_number": "Référence", "rev": "Rév.", "material": "Matière", "qty": "Qté", "est_cost": "Coût (€)", "cost_source": "Source du coût", "score": "Criticité", "tier": "Niveau"})
+                st.dataframe(v, hide_index=True, width="stretch", column_config={"Criticité": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"), "Capacité": st.column_config.ProgressColumn(min_value=0, max_value=1, format="percent"), "Coût (€)": st.column_config.NumberColumn(format="%.0f")})
+                st.caption(f"{len(v)} références · {fmt_eur(v['Coût (€)'].sum())} estimés · {v['Qté'].sum()} pièces par groupe motopropulseur.")
+        with tabs[1]:
+            if pd.isna(s["contract_end"]):
+                st.info("Pas de contrat en cours avec ce fournisseur.")
+            else:
+                st.markdown(f"**{s['contract_type']}** du {s['contract_start']:%d/%m/%Y} au {s['contract_end']:%d/%m/%Y} · {s['months_left']:.1f} mois restants · capacité allouée {s['capacity_pct']} %")
+                if s["months_left"] <= st.session_state.weights["contract_months"]:
+                    st.warning(f"Échéance sous {st.session_state.weights['contract_months']} mois : les pièces de ce fournisseur reçoivent +{st.session_state.weights['contract_points']} points de criticité. Renégocier ou consulter.")
+            tl = extras.contract_timeline(SUPPLIERS)
+            fig = px.timeline(tl, x_start="start", x_end="contract_end", y="name", color="contract_status",
+                              color_discrete_map={"En cours": C_OK, "Expire < 6 mois": C_WARN, "Expire < 3 mois": C_BAD, "Expiré": "#6b7280"},
+                              hover_data={"contract_type": True, "months_left": True, "start": False, "contract_end": "|%d/%m/%Y"})
+            fig.add_vline(x=pd.Timestamp(extras.TODAY).timestamp() * 1000, line_dash="dash", line_color="#1c2430")
+            fig.update_yaxes(autorange="reversed", title=None)
+            fig.update_xaxes(title=None)
+            fig.update_layout(legend_title=None)
+            st.plotly_chart(plotly_base(fig, 360), width="stretch", config={"displayModeBar": False})
+            st.caption("Ligne pointillée : aujourd'hui. Les durées de contrat viennent du catalogue fournisseur (data/suppliers.csv).")
+        with tabs[2]:
+            a, b = st.columns(2)
+            with a:
+                e = prim.sort_values("esg_index")
+                fig = px.bar(e, x="name", y="esg_index", text="esg_index", color="esg_index", color_continuous_scale=["#bfe3b4", "#2f9e44"])
+                fig.update_traces(textposition="outside", marker_line_width=0)
+                fig.update_layout(margin=dict(t=40), title="Indice ESG des fournisseurs principaux", xaxis_title=None, yaxis_title=None, coloraxis_showscale=False, title_font_size=13)
+                room(fig, e["esg_index"], "y", 1.15)
+                st.plotly_chart(plotly_base(fig, 320), width="stretch", config={"displayModeBar": False})
+            with b:
+                t = prim.sort_values("answer_time_days")
+                fig = px.bar(t, x="name", y="answer_time_days", text="answer_time_days", color="answer_time_days", color_continuous_scale=["#9ec5fe", "#0b3d91"])
+                fig.update_traces(textposition="outside", marker_line_width=0)
+                fig.update_layout(margin=dict(t=40), title="Délai de réponse aux RFQ (jours)", xaxis_title=None, yaxis_title=None, coloraxis_showscale=False, title_font_size=13)
+                room(fig, t["answer_time_days"], "y", 1.15)
+                st.plotly_chart(plotly_base(fig, 320), width="stretch", config={"displayModeBar": False})
+            cost_by_sup = RISK.groupby("supplier")["est_cost"].sum().reindex(prim["name"]).fillna(0)
+            sc = prim.assign(cost=cost_by_sup.values)
+            fig = px.scatter(sc, x="esg_index", y="answer_time_days", size="cost", color="contract_status", text="name", size_max=42,
+                             color_discrete_map={"En cours": C_OK, "Expire < 6 mois": C_WARN, "Expire < 3 mois": C_BAD, "Expiré": "#6b7280"},
+                             labels={"esg_index": "Indice ESG", "answer_time_days": "Délai de réponse (j)"})
+            fig.update_traces(textposition="top center", textfont_size=10)
+            fig.update_layout(margin=dict(t=40), title="Positionnement : ESG × réactivité, taille = coût confié", legend_title=None, title_font_size=13)
+            st.plotly_chart(plotly_base(fig, 380), width="stretch", config={"displayModeBar": False})
+        with tabs[3]:
+            st.markdown("**Carte ESG du réseau** : couleur = indice ESG (rouge faible → vert élevé), taille = coût confié (les alternatifs, sans pièce attribuée, sont les petits points). Zoom, déplacement et survol pour le détail.")
+            f1, f2, f3 = st.columns([2, 2, 3])
+            esg_min = f1.slider("Indice ESG minimum", 0, 100, 0, 5)
+            show_alt = f2.toggle("Afficher les alternatifs", value=True)
+            cats = f3.multiselect("Catégories", sorted(SUPPLIERS["supplier_category"].unique()), default=[], placeholder="Toutes les catégories")
+            m = SUPPLIERS.copy()
+            m["cost"] = m["name"].map(RISK.groupby("supplier")["est_cost"].sum()).fillna(0)
+            m["size"] = m["cost"] + 8
+            m = m.loc[(m["esg_index"] >= esg_min) & (m["primary"] | show_alt)]
+            if cats:
+                m = m.loc[m["supplier_category"].isin(cats)]
+            m["Statut"] = m["primary"].map({True: "Principal", False: "Alternatif"})
+            fig = px.scatter_map(m, lat="lat", lon="lon", color="esg_index", size="size", size_max=26, zoom=4.1, center=dict(lat=47.8, lon=8.5), hover_name="name",
+                                 color_continuous_scale=["#d13438", "#f2c14e", "#1a9c5b"], range_color=[40, 90], opacity=0.9,
+                                 hover_data={"supplier_category": True, "city": True, "country": True, "esg_index": True, "rating": True, "answer_time_days": True, "contract_status": True, "Statut": True, "cost": ":.0f", "lat": False, "lon": False, "size": False},
+                                 labels={"esg_index": "ESG", "supplier_category": "Catégorie", "city": "Ville", "country": "Pays", "rating": "Note", "answer_time_days": "Délai (j)", "contract_status": "Contrat", "cost": "Coût confié (€)"},
+                                 map_style="open-street-map")
+            fig.update_layout(coloraxis_colorbar=dict(title="ESG", thickness=12, len=0.6), legend=dict(orientation="h", y=1.02, x=0))
+            st.plotly_chart(plotly_base(fig, 520), width="stretch", config={"scrollZoom": True})
+            st.caption("Fond de carte OpenStreetMap (connexion internet nécessaire). Indices ESG : données d'exemple du catalogue.")
+            lo = m.sort_values("esg_index").head(3)
+            if not lo.empty:
+                st.markdown("**Points d'attention ESG** : " + " · ".join(f"{x.name} ({x.esg_index}, {x.supplier_category})" for x in lo.itertuples()))
+            st.dataframe(m[["name", "supplier_category", "city", "country", "esg_index", "rating", "Statut", "contract_status"]].rename(columns={"name": "Fournisseur", "supplier_category": "Catégorie", "city": "Ville", "country": "Pays", "esg_index": "ESG", "rating": "Note", "contract_status": "Contrat"}).sort_values("ESG"), hide_index=True, width="stretch", height=240)
+
+
+# ---------------------------------------------------------------------------
+# Page : Risques & couverture
+# ---------------------------------------------------------------------------
+RISK_TYPES = ["Composant", "Fournisseur", "Externe", "Matière", "Qualité", "Logistique", "Réglementaire"]
+
+
+def all_risks() -> list[dict]:
+    return extras.auto_risks(RISK, SUPPLIERS, MATS) + st.session_state.risks_manual
+
+
+def page_risks():
+    topbar("Risques & couverture", "Registre des risques (automatiques et saisis), matrice probabilité × impact, options de couverture")
+    risks = all_risks()
+    open_r = [r for r in risks if r["status"] != "Clos"]
+    c = st.columns(4)
+    kpi(c[0], "Risques ouverts", len(open_r), f"{sum(1 for r in open_r if r['source'] == 'auto')} déduits des données · {sum(1 for r in open_r if r['source'] != 'auto')} saisis")
+    kpi(c[1], "Risques majeurs", sum(1 for r in open_r if r["probability"] * r["impact"] >= 12), "probabilité × impact ≥ 12", sample=True)
+    kpi(c[2], "Contrats à sécuriser", sum(1 for r in open_r if r["type"] == "Fournisseur"), "échéance sous 6 mois")
+    kpi(c[3], "Exposition matières volatiles", fmt_eur(float((RISK.loc[RISK["family"].isin(["Aluminium", "Cuivre"]), "est_cost"] / RISK.loc[RISK["family"].isin(["Aluminium", "Cuivre"]), "process_factor"]).sum())), "part matière alu + cuivre par GMP", sample=True)
+    st.write("")
+
+    l, r_ = st.columns([5, 7], gap="medium")
+    with l:
+        widget_open("Matrice des risques", "Nombre de risques ouverts par probabilité (lignes) et impact (colonnes).")
+        mtx = extras.risk_matrix(risks)
+        sev = np.add.outer(np.arange(1, 6), np.zeros(5)) * np.add.outer(np.zeros(5), np.arange(1, 6))
+        colors = [[0, "#8fd19e"], [0.3, "#8fd19e"], [0.3, "#ffe066"], [0.55, "#ffe066"], [0.55, "#e03131"], [1, "#e03131"]]
+        fig = go.Figure(go.Heatmap(z=sev / 25, x=["1 · Négligeable", "2 · Mineur", "3 · Modéré", "4 · Majeur", "5 · Élevé"], y=["1 · Rare", "2 · Improbable", "3 · Possible", "4 · Probable", "5 · Quasi certain"],
+                                   colorscale=colors, showscale=False, xgap=3, ygap=3, hoverinfo="skip"))
+        for i in range(5):
+            for j in range(5):
+                if mtx[i, j]:
+                    fig.add_annotation(x=j, y=i, text=f"<b>{mtx[i, j]}</b>", showarrow=False, font=dict(size=16, color="#1c2430"))
+        fig.update_layout(xaxis_title="Impact", yaxis_title="Probabilité")
+        st.plotly_chart(plotly_base(fig, 360), width="stretch", config={"displayModeBar": False})
+        widget_close()
+
+        widget_open("Ajouter un risque", "Risque externe au produit, événement fournisseur, aléa réglementaire… Il entre dans la matrice et le registre.")
+        with st.form("add_risk", clear_on_submit=True):
+            title = st.text_input("Intitulé", placeholder="Ex. : droits de douane sur les tôles magnétiques importées")
+            a, b = st.columns(2)
+            rtype = a.selectbox("Type", RISK_TYPES, index=2)
+            linked = b.selectbox("Lié à", ["—"] + sorted(RISK["short"].unique().tolist()) + sorted(SUPPLIERS["name"].tolist()) + sorted(MATS["family"].unique().tolist()))
+            a, b = st.columns(2)
+            prob = a.slider("Probabilité", 1, 5, 3)
+            imp = b.slider("Impact", 1, 5, 3)
+            mitig = st.text_input("Mesure de couverture envisagée", placeholder="Ex. : seconde source, contrat à terme, stock de sécurité")
+            if st.form_submit_button("Ajouter au registre", type="primary") and title:
+                fam = linked if linked in set(MATS["family"]) else (RISK.set_index("short")["family"].get(linked, "") if linked in set(RISK["short"]) else "")
+                cat = SUPPLIERS.set_index("name")["supplier_category"].get(linked, "") if linked in set(SUPPLIERS["name"]) else (RISK.set_index("short")["supplier_category"].get(linked, "") if linked in set(RISK["short"]) else "")
+                st.session_state.risks_manual.append(dict(id=f"M-{len(st.session_state.risks_manual) + 1}", title=title, type=rtype, source="manuel", probability=prob, impact=imp,
+                                                          linked=linked if linked != "—" else "", linked_id="", family=fam, supplier_category=cat, mitigation=mitig, status="Ouvert"))
+                st.rerun()
+        widget_close()
+
+    with r_:
+        widget_open("Registre des risques", "Cliquez sur une ligne pour voir les options de couverture. Les risques « auto » sont recalculés à chaque chargement à partir de la criticité, des contrats et des marchés.")
+        df = pd.DataFrame(risks)
+        df["Sévérité"] = df["probability"] * df["impact"]
+        df = df.sort_values("Sévérité", ascending=False)
+        view = df[["title", "type", "source", "probability", "impact", "Sévérité", "mitigation", "status", "id"]].rename(columns={"title": "Risque", "type": "Type", "source": "Source", "probability": "Prob.", "impact": "Impact", "mitigation": "Couverture", "status": "Statut"})
+        ev = st.dataframe(view, hide_index=True, width="stretch", height=380, on_select="rerun", selection_mode="single-row", key="risk_reg",
+                          column_config={"id": None, "Sévérité": st.column_config.ProgressColumn(min_value=0, max_value=25, format="%d"), "Risque": st.column_config.TextColumn(width="large")})
+        picked = df.iloc[ev.selection.rows[0]] if ev.selection.rows else df.iloc[0]
+        if picked["source"] != "auto":
+            a, b = st.columns(2)
+            if a.button("Clore ce risque" if picked["status"] != "Clos" else "Rouvrir ce risque"):
+                for m in st.session_state.risks_manual:
+                    if m["id"] == picked["id"]:
+                        m["status"] = "Clos" if m["status"] != "Clos" else "Ouvert"
+                st.rerun()
+            if b.button("Supprimer"):
+                st.session_state.risks_manual = [m for m in st.session_state.risks_manual if m["id"] != picked["id"]]
+                st.rerun()
+        st.download_button("Exporter le registre (CSV)", df.drop(columns=["linked_id"]).to_csv(index=False).encode("utf-8"), "registre_risques.csv")
+        widget_close()
+
+        widget_open(f"Couverture : {picked['title']}", "Alternatives classées par pertinence : couverture financière (forward, futures), matière de substitution, fournisseur alternatif, contrat, stock.")
+        opts = extras.hedging_options(RISK, MATS, SUPPLIERS, family=picked.get("family", ""), supplier_category=picked.get("supplier_category", ""), xml_id=picked.get("linked_id", ""))
+        if not opts:
+            st.info("Pas de proposition automatique pour ce risque : renseignez la mesure de couverture dans le registre.")
+        kind_chip = {"Couverture financière": "info", "Matière alternative": "ok", "Fournisseur alternatif": "warn", "Contrat": "fill", "Stock": "fill"}
+        for o in opts:
+            st.markdown(f"{chip(o['kind'], kind_chip.get(o['kind'], 'info'))} &nbsp;**{html.escape(o['label'])}**<br><span style='color:#5d6b7e;font-size:.84rem'>{html.escape(o['detail'])}</span>", unsafe_allow_html=True)
+        widget_close()
+
+
+# ---------------------------------------------------------------------------
+# Page : Mise à jour de la nomenclature
+# ---------------------------------------------------------------------------
+def page_bom_update():
+    topbar("Mise à jour de la nomenclature", "Ajoutez un composant, un sous-assemblage ou un lot de composants : ils entrent dans toutes les analyses")
+    st.markdown('<p class="plm-lede">L\'export OEM reste intact : les ajouts sont superposés à la nomenclature, marqués « Ajout manuel », et pris en compte dans les masses, la criticité, les fournisseurs et l\'assistant. Un prix saisi remplace l\'estimation matière.</p>', unsafe_allow_html=True)
+    l, r_ = st.columns([5, 7], gap="medium")
+    asm = MODEL.bom.loc[MODEL.bom["role"] == "assembly"].sort_values("level")
+    asm_labels = {o: f"{'   ' * int(lv)}{s} (rév. {rv})" for o, s, lv, rv in zip(asm["occ"], asm["short"], asm["level"], asm["rev"])}
+    with l:
+        widget_open("Ajouter un composant ou un sous-assemblage")
+        with st.form("add_comp", clear_on_submit=True):
+            kind = st.radio("Type", ["Pièce", "Sous-assemblage"], horizontal=True)
+            name = st.text_input("Nom", placeholder="Ex. : Capteur de position rotor")
+            parent = st.selectbox("Assemblage parent", list(asm_labels), format_func=asm_labels.get)
+            a, b = st.columns(2)
+            material = a.selectbox("Matière", ["—"] + MATS["material"].tolist())
+            rev = b.selectbox("Révision", list("ABCD"))
+            a, b, d = st.columns(3)
+            mass = a.number_input("Masse unitaire (kg)", min_value=0.0, value=0.1, step=0.01, format="%.3f")
+            qty = b.number_input("Quantité", min_value=1, value=1, step=1)
+            price = d.number_input("Prix unitaire (€, optionnel)", min_value=0.0, value=0.0, step=0.5)
+            desc = st.text_input("Description", placeholder="Optionnel")
+            if st.form_submit_button("Ajouter à la nomenclature", type="primary") and name:
+                st.session_state.additions.append(dict(name=name, kind="part" if kind == "Pièce" else "assembly", parent_occ=parent, material="" if material == "—" else material,
+                                                       mass_kg=mass, qty=int(qty), rev=rev, unit_cost=price or None, description=desc))
+                st.rerun()
+        widget_close()
+        widget_open("Importer un lot (CSV)", "Colonnes : name, kind (part|assembly), parent_occ, material, mass_kg, qty, rev, unit_cost, description. Les occ des assemblages sont listées à droite.")
+        up = st.file_uploader("Fichier CSV", type=["csv"], label_visibility="collapsed")
+        if up is not None and st.button("Importer"):
+            df = pd.read_csv(up).fillna("")
+            n = 0
+            for _, x in df.iterrows():
+                if x.get("name") and str(x.get("parent_occ")) in asm_labels:
+                    st.session_state.additions.append(dict(name=x["name"], kind=x.get("kind", "part") or "part", parent_occ=str(x["parent_occ"]), material=x.get("material", ""), mass_kg=float(x.get("mass_kg") or 0),
+                                                           qty=int(x.get("qty") or 1), rev=x.get("rev", "A") or "A", unit_cost=float(x["unit_cost"]) if x.get("unit_cost") not in ("", None) else None, description=x.get("description", "")))
+                    n += 1
+            st.success(f"{n} ligne(s) importée(s).")
+            st.rerun()
+        st.download_button("Modèle CSV", "name,kind,parent_occ,material,mass_kg,qty,rev,unit_cost,description\nCapteur de position rotor,part,79,Polyamide PA66-GF30,0.08,2,A,18.5,Capteur à effet Hall\nModule onduleur,assembly,0,,0,1,A,,Électronique de puissance\n", "modele_ajouts.csv")
+        widget_close()
+    with r_:
+        widget_open("Ajouts en cours", f"{len(st.session_state.additions)} ajout(s). Supprimez une ligne pour revenir en arrière ; l'export OEM n'est jamais modifié.")
+        if st.session_state.additions:
+            df = pd.DataFrame(st.session_state.additions)
+            df["parent"] = df["parent_occ"].map(lambda o: asm_labels.get(o, o).strip())
+            view = df[["name", "kind", "parent", "material", "mass_kg", "qty", "rev", "unit_cost"]].rename(columns={"name": "Nom", "kind": "Type", "parent": "Parent", "material": "Matière", "mass_kg": "Masse (kg)", "qty": "Qté", "rev": "Rév.", "unit_cost": "Prix (€)"})
+            ev = st.dataframe(view, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="add_tbl")
+            a, b = st.columns(2)
+            if ev.selection.rows and a.button("Supprimer la ligne sélectionnée"):
+                st.session_state.additions.pop(ev.selection.rows[0])
+                st.rerun()
+            if b.button("Tout annuler"):
+                st.session_state.additions = []
+                st.rerun()
+        else:
+            st.info("Aucun ajout pour l'instant. Le formulaire de gauche ajoute un composant ; le CSV en ajoute plusieurs.")
+        widget_close()
+        widget_open("Nomenclature enrichie", "Vue de contrôle : masses recalculées, ajouts surlignés par leur origine.")
+        v = MODEL.bom.loc[MODEL.bom["role"] != "geometry", ["short", "level", "role_label", "rev", "material", "mass_kg", "origin", "occ"]].copy()
+        v["short"] = v.apply(lambda x: (" " * int(x["level"])) + x["short"], axis=1)
+        v = v.rename(columns={"short": "Composant", "role_label": "Type", "rev": "Rév.", "material": "Matière", "mass_kg": "Masse (kg)", "origin": "Origine", "occ": "occ"}).drop(columns="level")
+        st.dataframe(v, hide_index=True, width="stretch", height=380, column_config={"Masse (kg)": st.column_config.NumberColumn(format="%.3f")})
+        out = MODEL.bom.drop(columns=[c for c in ("children",) if c in MODEL.bom.columns])
+        st.download_button("Exporter la nomenclature enrichie (CSV)", out.to_csv(index=False).encode("utf-8"), "nomenclature_enrichie.csv")
+        widget_close()
+
+
+# ---------------------------------------------------------------------------
+# Page : Paramètres de criticité
+# ---------------------------------------------------------------------------
+def page_settings():
+    topbar("Paramètres de criticité", "Adaptez les critères, leurs pondérations et les seuils aux besoins du client ; la table se recalcule en direct")
+    w = st.session_state.weights
+    l, r_ = st.columns([5, 7], gap="medium")
+    with l:
+        widget_open("Critères de base", "Parts relatives ; elles sont normalisées pour donner un score de base sur 100.")
+        for k in ("w_risk", "w_cost", "w_mass", "w_qty"):
+            w[k] = st.slider(analytics.WEIGHT_LABELS[k], 0, 100, int(w[k]), 5, key=f"s_{k}")
+        tot = w["w_risk"] + w["w_cost"] + w["w_mass"] + w["w_qty"]
+        st.caption(f"Total {tot} → parts normalisées : risque {w['w_risk'] / max(tot, 1):.0%}, coût {w['w_cost'] / max(tot, 1):.0%}, masse {w['w_mass'] / max(tot, 1):.0%}, occurrences {w['w_qty'] / max(tot, 1):.0%}.")
+        widget_close()
+        widget_open("Malus additionnels", "Points ajoutés au score de base (plafonné à 100).")
+        a, b = st.columns(2)
+        w["rev_points"] = a.slider(analytics.WEIGHT_LABELS["rev_points"], 0, 20, int(w["rev_points"]), key="s_rev_points")
+        w["rev_cap"] = b.slider(analytics.WEIGHT_LABELS["rev_cap"], 0, 40, int(w["rev_cap"]), key="s_rev_cap")
+        a, b = st.columns(2)
+        w["contract_points"] = a.slider(analytics.WEIGHT_LABELS["contract_points"], 0, 30, int(w["contract_points"]), key="s_cp")
+        w["contract_months"] = b.slider(analytics.WEIGHT_LABELS["contract_months"], 1, 24, int(w["contract_months"]), key="s_cm")
+        a, b = st.columns(2)
+        w["esg_points"] = a.slider(analytics.WEIGHT_LABELS["esg_points"], 0, 30, int(w["esg_points"]), key="s_ep")
+        w["esg_floor"] = b.slider(analytics.WEIGHT_LABELS["esg_floor"], 0, 100, int(w["esg_floor"]), 5, key="s_ef")
+        widget_close()
+        widget_open("Seuils des niveaux")
+        a, b = st.columns(2)
+        w["crit"] = a.slider(analytics.WEIGHT_LABELS["crit"], 10, 100, int(w["crit"]), 5, key="s_crit")
+        w["watch"] = b.slider(analytics.WEIGHT_LABELS["watch"], 0, int(w["crit"]) - 5, min(int(w["watch"]), int(w["crit"]) - 5), 5, key="s_watch")
+        a, b = st.columns(2)
+        if a.button("Rétablir les valeurs par défaut"):
+            st.session_state.weights = dict(analytics.DEFAULT_WEIGHTS)
+            for k in list(st.session_state):
+                if k.startswith("s_"):
+                    del st.session_state[k]
+            st.rerun()
+        b.download_button("Exporter le profil (JSON)", json.dumps(w, ensure_ascii=False, indent=2), "profil_criticite.json")
+        widget_close()
+    with r_:
+        new = analytics.part_risk(MODEL, MATS, w, SUPPLIERS)
+        base = analytics.part_risk(MODEL, MATS, analytics.DEFAULT_WEIGHTS, SUPPLIERS).set_index("xml_id")
+        default = base["score"]
+        changed = int((new["tier"].values != new["xml_id"].map(base["tier"]).values).sum())
+        c = st.columns(3)
+        kpi(c[0], "Critiques", int((new["tier"] == "Critique").sum()), f"seuil ≥ {w['crit']}")
+        kpi(c[1], "À surveiller", int((new["tier"] == "À surveiller").sum()), f"seuil ≥ {w['watch']}")
+        kpi(c[2], "Changements de niveau", changed, "par rapport au profil par défaut")
+        widget_open("Aperçu du classement avec ce profil", "Δ : écart de score par rapport au profil par défaut.")
+        v = new[["short", "rev", "material", "supplier", "contract_status", "est_cost", "score_base", "score", "tier", "xml_id"]].copy()
+        v["Δ"] = v["score"] - v["xml_id"].map(default)
+        v = v.drop(columns="xml_id").rename(columns={"short": "Composant", "rev": "Rév.", "material": "Matière", "supplier": "Fournisseur", "contract_status": "Contrat", "est_cost": "Coût (€)", "score_base": "Base", "score": "Score", "tier": "Niveau"})
+        st.dataframe(v, hide_index=True, width="stretch", height=560, column_config={"Score": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"), "Coût (€)": st.column_config.NumberColumn(format="%.0f")})
+        widget_close()
+
+
 # ---------------------------------------------------------------------------
 # Navigation (barre latérale type « boussole »)
 # ---------------------------------------------------------------------------
@@ -542,15 +984,19 @@ pages = {
     "explorer": st.Page(page_explorer, title="Product Explorer", icon=":material/account_tree:", default=True),
     "intel": st.Page(page_intelligence, title="Product Intelligence", icon=":material/insights:", url_path="intelligence"),
     "impact": st.Page(page_impact, title="Change Impact", icon=":material/swap_horiz:", url_path="impact"),
+    "suppliers": st.Page(page_suppliers, title="Fournisseurs", icon=":material/factory:", url_path="suppliers"),
+    "risks": st.Page(page_risks, title="Risques & couverture", icon=":material/shield:", url_path="risks"),
+    "bom": st.Page(page_bom_update, title="Mise à jour BOM", icon=":material/playlist_add:", url_path="bom-update"),
+    "settings": st.Page(page_settings, title="Paramètres de criticité", icon=":material/tune:", url_path="settings"),
     "quality": st.Page(page_quality, title="Qualité des données", icon=":material/fact_check:", url_path="quality"),
     "assistant": st.Page(page_assistant, title="Assistant PLM", icon=":material/forum:", url_path="assistant"),
 }
 with st.sidebar:
     st.markdown('<div style="padding:6px 0 12px"><div style="font-size:1.1rem;font-weight:700">PLM Intelligence</div><div style="font-size:.78rem;color:#b7c4d9">Fournisseur e-motor · données OEM</div></div>', unsafe_allow_html=True)
-nav = st.navigation({"Applications": list(pages.values())}, position="sidebar")
+nav = st.navigation({"Analyse": [pages[k] for k in ("explorer", "intel", "impact", "assistant")], "Pilotage": [pages[k] for k in ("suppliers", "risks", "bom", "settings", "quality")]}, position="sidebar")
 with st.sidebar:
     st.markdown("---")
-    st.markdown(f'<div style="font-size:.75rem;color:#b7c4d9">Export : {html.escape(MODEL.source_name)}<br>{KPI["products"]} objets · {len(BOM)} occurrences<br>Référentiel matières : exemple</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:.75rem;color:#b7c4d9">Export : {html.escape(MODEL.source_name)}<br>{KPI["products"]} objets · {len(BOM)} occurrences<br>Référentiel matières : exemple<br>Ajouts manuels : {len(st.session_state.additions)}</div>', unsafe_allow_html=True)
 target = st.session_state.pop("nav_target", None)
 if target:
     st.switch_page(pages[target])

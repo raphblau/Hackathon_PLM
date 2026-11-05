@@ -1,0 +1,17 @@
+supplier_id,name,supplier_category,primary,country,city,lat,lon,rating,esg_index,answer_time_days,contract_start,contract_end,contract_type,capacity_pct,note
+S01,AluCast Ibérica,Fonderie sous pression alu,True,Espagne,Saragosse,41.65,-0.88,4,72,6,2024-01-01,2026-12-31,Contrat cadre,88,Fonderie HPDC 1600 t ; prix indexé LME alu
+S02,GearTech Sachsen,Forge & taillage d'engrenages,True,Allemagne,Chemnitz,50.83,12.92,5,81,4,2025-03-01,2028-02-28,Contrat cadre,92,Taillage et rectification ; stock de sécurité 4 semaines
+S03,LamiCore Italia,Découpe de tôles magnétiques,True,Italie,Brescia,45.54,10.22,3,64,12,2025-01-01,2027-03-31,Contrat cadre,97,Capacité saturée par la demande VE ; source unique
+S04,CuWind Polska,Fil émaillé / bobinage,True,Pologne,Wrocław,51.11,17.03,3,58,9,2025-01-01,2027-01-31,Contrat cadre,90,Prix indexé LME cuivre mensuel
+S05,RollTech Schweinfurt,Roulementier,True,Allemagne,Schweinfurt,50.05,10.23,5,85,15,2023-07-01,2026-12-31,Contrat cadre,85,Catalogue ; délai 16 semaines
+S06,ShaftPro Lyon,Forge & usinage arbres,True,France,Lyon,45.76,4.84,4,70,5,2025-09-01,2028-08-31,Contrat cadre,80,Arbres trempés revenus
+S07,Extrual Normandie,Extrusion & usinage alu,True,France,Rouen,49.44,1.10,4,68,7,2024-04-01,2027-03-31,Contrat cadre,75,Profilés 6082 et usinage
+S08,FastFix Bohemia,Visserie,True,Tchéquie,Brno,49.19,16.61,4,61,3,2026-01-01,2026-12-31,Commande spot,70,Visserie classe 10.9 zinc-lamellaire
+S09,Fonderie du Jura,Fonderie fonte,True,France,Lons-le-Saunier,46.67,5.55,3,66,10,2024-01-01,2027-12-31,Contrat cadre,82,Fonte GS
+S10,SealChem Rhein,Joints élastomères,True,Allemagne,Mannheim,49.49,8.47,3,55,14,2025-06-01,2026-11-30,Contrat cadre,78,FKM : exposition à la restriction PFAS
+S11,Tôlerie Vosges,Tôlerie / découpe,True,France,Épinal,48.17,6.45,4,69,4,2025-01-01,2027-12-31,Contrat cadre,65,Découpe laser et emboutissage
+S12,PlastInject Turin,Injection plastique,True,Italie,Turin,45.07,7.69,4,63,6,2025-04-01,2027-03-31,Contrat cadre,72,PA66-GF30 et PA6-GF30
+S13,DieCast Košice,Fonderie sous pression alu,False,Slovaquie,Košice,48.72,21.26,3,60,8,,,Non contractualisé,60,Seconde source possible pour les carters
+S14,BearingHub Ljubljana,Roulementier,False,Slovénie,Ljubljana,46.05,14.51,4,74,10,,,Non contractualisé,70,Distributeur multi-marques
+S15,MagCast Austria,Fonderie sous pression magnésium,False,Autriche,Ranshofen,48.22,13.03,4,71,9,,,Non contractualisé,55,Seul fondeur magnésium qualifié automobile en UE
+S16,EuroLam Steel,Découpe de tôles magnétiques,False,Belgique,Liège,50.63,5.57,3,62,11,,,Non contractualisé,50,Seconde source tôle NO ; qualification 9 mois
