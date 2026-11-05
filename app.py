@@ -41,7 +41,12 @@ def load_all(xml_bytes: bytes | None):
     if xml_bytes:
         path = ROOT / "data" / "_uploaded.xml"
         path.write_bytes(xml_bytes)
-    model = parser.load(path)
+    try:
+        model = parser.load(path)
+    except Exception as e:  # fichier invalide : on revient à l'export d'origine en le signalant
+        st.session_state["load_error"] = f"{type(e).__name__} : {e}"
+        path = XML_PATH
+        model = parser.load(path)
     mats = analytics.load_materials(MAT_PATH)
     risk = analytics.part_risk(model, mats)
     xml_lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -133,11 +138,17 @@ SUPPLIERS = extras.load_suppliers(SUP_PATH)
 st.session_state.setdefault("weights", dict(analytics.DEFAULT_WEIGHTS))
 st.session_state.setdefault("additions", [])
 st.session_state.setdefault("risks_manual", [])
-MODEL = extras.apply_additions(BASE_MODEL, st.session_state.additions)
+st.session_state.setdefault("edits", {})
+MODEL = extras.apply_additions(BASE_MODEL, st.session_state.additions, st.session_state.edits)
 RISK = analytics.part_risk(MODEL, MATS, st.session_state.weights, SUPPLIERS)
 BOM = MODEL.bom
 KPI = analytics.kpis(MODEL, RISK)
 SUBS = ["Tous"] + BOM.loc[BOM["level"] == 1, "short"].tolist()
+_PALETTE = ["#1f6feb", "#7a5af8", "#0f9d8a", "#c77d00", "#d13438", "#2f9e44", "#e8590c", "#5d6b7e"]
+for _i, _n in enumerate(SUBS[1:]):
+    SUB_COLORS.setdefault(_n, _PALETTE[_i % len(_PALETTE)])
+MATURITY_VIOL = analytics.maturity_consistency(MODEL)
+LLM = assistant.llm_backend()
 st.session_state.setdefault("sel_occ", "148.152")
 st.session_state.setdefault("ci_part", "ID_54")
 st.session_state.setdefault("ci_mat", "Magnesium alloy AZ91D (HPDC)")
@@ -145,7 +156,7 @@ st.session_state.setdefault("chat", [])
 
 
 def topbar(app: str, ctx: str):
-    mode = "Assistant : Claude" if assistant.has_api_key() else "Assistant : mode hors ligne"
+    mode = "Assistant : " + LLM["label"]
     st.markdown(
         f'<div class="plm-topbar"><div class="compass"></div><div><div class="app">{html.escape(app)}</div>'
         f'<div class="ctx">{html.escape(ctx)}</div></div><div class="spacer"></div>'
@@ -212,28 +223,65 @@ def page_explorer():
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
         widget_close()
 
-        widget_open("Nomenclature (BOM)", "Sélectionnez une ligne pour afficher ses propriétés et sa source XML.")
-        f1, f2 = st.columns([3, 1])
+        widget_open("Nomenclature (BOM)", "Regroupée pour s'y retrouver : dépliez un groupe, puis sélectionnez une ligne pour ses propriétés et sa source XML.")
+        f1, f2, f3 = st.columns([3, 2, 1])
         q = f1.text_input("Rechercher", placeholder="Pièce, matière, référence, instance…", label_visibility="collapsed")
-        show_geo = f2.toggle("Rep. 3D", value=False)
+        group_mode = f2.selectbox("Regrouper par", ["Arborescence", "Type de composant", "Matière", "Fournisseur", "Maturité"], label_visibility="collapsed")
+        show_geo = f3.toggle("Rep. 3D", value=False)
         tbl = BOM if show_geo else BOM.loc[BOM["role"] != "geometry"]
         if sub:
             tbl = tbl.loc[(tbl["level"] == 0) | (tbl["subassembly"] == sub)]
         if q:
             hay = (tbl["short"] + " " + tbl["material"] + " " + tbl["part_number"] + " " + tbl["instance_name"]).str.lower()
             tbl = tbl.loc[hay.str.contains(q.lower(), regex=False)]
-        view = pd.DataFrame({
-            "Composant": tbl.apply(lambda r: (" " * r["level"]) + ("▸ " if r["role"] == "assembly" else "") + r["short"] + (" [3D]" if r["role"] == "geometry" else ""), axis=1),
-            "Rév.": tbl["rev"], "Maturité": tbl["maturity"], "Matière": tbl["material"].str.replace(r"\s*\(.*?\)", "", regex=True),
-            "Masse (kg)": tbl["mass_kg"], "occ": tbl["occ"],
-        })
-        ev = st.dataframe(
-            view, hide_index=True, height=420, on_select="rerun", selection_mode="single-row", width="stretch",
-            column_config={"occ": None, "Masse (kg)": st.column_config.NumberColumn(format="%.3f"), "Composant": st.column_config.TextColumn(width="medium")},
-            key="bom_table",
-        )
-        if ev.selection.rows:
-            st.session_state.sel_occ = view.iloc[ev.selection.rows[0]]["occ"]
+        bad_parents, bad_children = set(MATURITY_VIOL["parent_occ"]), set(MATURITY_VIOL["child_occ"])
+        sup_of = RISK.set_index("xml_id")["supplier"]
+
+        def coherence(o):
+            return "⚠ enfants moins mûrs" if o in bad_parents else "⚠ parent plus mûr" if o in bad_children else "✓"
+
+        def table(rows: pd.DataFrame, key: str, indent=True):
+            view = pd.DataFrame({
+                "Composant": rows.apply(lambda r: ((" " * (r["level"] - 1)) if indent else "") + ("▸ " if r["role"] == "assembly" else "") + r["short"] + (" [3D]" if r["role"] == "geometry" else ""), axis=1),
+                "Rév.": rows["rev"], "Maturité": rows["maturity"], "Cohérence": rows["occ"].map(coherence),
+                "Matière": rows["material"].str.replace(r"\s*\(.*?\)", "", regex=True), "Masse (kg)": rows["mass_kg"], "Origine": rows["origin"], "occ": rows["occ"],
+            })
+            ev = st.dataframe(view, hide_index=True, height=min(60 + 35 * len(view), 420), on_select="rerun", selection_mode="single-row", width="stretch",
+                              column_config={"occ": None, "Masse (kg)": st.column_config.NumberColumn(format="%.3f"), "Composant": st.column_config.TextColumn(width="medium")}, key=key)
+            if ev.selection.rows:
+                st.session_state.sel_occ = view.iloc[ev.selection.rows[0]]["occ"]
+
+        if group_mode == "Arborescence":
+            root_rows = tbl.loc[tbl["level"] == 0]
+            if not root_rows.empty:
+                table(root_rows, "bom_root", indent=False)
+            for s1 in BOM.loc[BOM["level"] == 1].itertuples():
+                branch = tbl.loc[tbl["subassembly"] == s1.short]
+                if branch.empty:
+                    continue
+                n_parts = int((branch["role"] == "part").sum())
+                with st.expander(f"{s1.short} · rév. {s1.rev} · {fmt_kg(s1.mass_kg)} kg · {n_parts} pièces · {coherence(s1.occ)}", expanded=(sub == s1.short) or bool(q)):
+                    direct = branch.loc[(branch["level"] == 1) | (branch["parent_occ"] == s1.occ) & (branch["role"] != "assembly")]
+                    sub_asm = branch.loc[(branch["role"] == "assembly") & (branch["level"] >= 2)]
+                    if not direct.empty:
+                        table(direct, f"bom_{s1.occ}")
+                    for s2 in sub_asm.itertuples():
+                        inner = branch.loc[branch["path"].str.startswith(s2.path + " ›") | (branch["occ"] == s2.occ)]
+                        st.markdown(f"**↳ {html.escape(s2.short)}** · rév. {s2.rev} · {fmt_kg(s2.mass_kg)} kg · {coherence(s2.occ)}", unsafe_allow_html=True)
+                        table(inner, f"bom_{s2.occ}")
+        else:
+            parts_only = tbl.loc[tbl["role"] != "assembly"].copy()
+            if group_mode == "Type de composant":
+                parts_only["grp"] = parts_only.apply(lambda r: icons.LABEL[icons.kind_of(r["short"], r["role"])], axis=1)
+            elif group_mode == "Matière":
+                parts_only["grp"] = parts_only["material"].str.replace(r"\s*\(.*?\)", "", regex=True).replace("", "Sans matière")
+            elif group_mode == "Fournisseur":
+                parts_only["grp"] = parts_only["xml_id"].map(sup_of).fillna("Non attribué").replace("", "Non attribué")
+            else:
+                parts_only["grp"] = parts_only["maturity"]
+            for grp, rows in sorted(parts_only.groupby("grp"), key=lambda kv: -kv[1]["mass_kg"].sum()):
+                with st.expander(f"{grp} · {len(rows)} occurrence(s) · {fmt_kg(rows['mass_kg'].sum())} kg", expanded=bool(q)):
+                    table(rows, f"bom_g_{abs(hash(grp))}", indent=False)
         widget_close()
 
     with right:
@@ -261,6 +309,7 @@ def page_explorer():
             props += [("Coût estimé*", f"{fmt_eur(k['est_cost'])} ({k['cost_source'].lower()})"), ("Risque appro*", k["risk_label"]),
                       ("Fournisseur*", f"{k['supplier'] or '—'} · {k['supplier_category']}" + (f" · contrat : {k['contract_status'].lower()}" if k["contract_status"] else "")),
                       ("Criticité*", f"{k['score']} / 100 · {k['tier']}")]
+        props.insert(4, ("Cohérence maturité", analytics.maturity_status(MODEL, r["occ"])))
         st.markdown('<div class="plm-props">' + "".join(f'<div class="k">{html.escape(a)}</div><div class="v">{html.escape(str(b))}</div>' for a, b in props) + "</div>", unsafe_allow_html=True)
         if r.get("origin") == "Ajout manuel":
             st.markdown('<div class="plm-src">Source : <b>saisie utilisateur</b> (page « Mise à jour de la nomenclature »), absent de l\'export OEM.' + (" &nbsp;* hypothèses du référentiel matières." if not rk.empty else "") + "</div>", unsafe_allow_html=True)
@@ -571,10 +620,13 @@ def page_quality():
         widget_open("Paramètres de l'export", "En-tête InfoHeader du paquet. Ni fichiers 3D, ni documents, ni paramètres PLM n'ont été exportés.")
         st.dataframe(MODEL.info.rename(columns={"name": "Paramètre", "value": "Valeur"}), hide_index=True, width="stretch", height=560)
         widget_close()
-    widget_open("Charger un autre export", "Le même traitement s'applique à tout fichier XPDMXML (structure produit 3DEXPERIENCE).")
+    widget_open("Charger un autre export", "Le même traitement s'applique à tout fichier XPDMXML (structure produit 3DEXPERIENCE), y compris un XML modifié exporté depuis cette application : le lecteur détecte l'espace de noms, la balise de masse et les préfixes de nom.")
+    if st.session_state.get("load_error"):
+        st.error("Le fichier chargé n'a pas pu être lu, l'export d'origine est affiché. " + st.session_state.pop("load_error"))
     up = st.file_uploader("Fichier XPDMXML", type=["xml"], label_visibility="collapsed")
     if up is not None and st.button("Analyser ce fichier"):
         st.session_state.xml_upload = up.getvalue()
+        st.session_state.additions, st.session_state.edits, st.session_state.chat = [], {}, []
         load_all.clear()
         st.rerun()
     if st.session_state.xml_upload and st.button("Revenir au fichier d'origine"):
@@ -600,11 +652,23 @@ SUGGESTIONS = [
 def page_assistant():
     topbar("Assistant PLM", "Interrogez la nomenclature en langage naturel ; chaque réponse cite les objets XML consultés")
     tb = assistant.Toolbox(MODEL, MATS, RISK)
-    online = assistant.has_api_key()
-    if online:
+    online = LLM["kind"] != "offline"
+    if LLM["kind"] == "claude":
         st.caption(f"Mode Claude ({assistant.MODEL_ID}) : le modèle choisit les outils à appeler, les résultats portent leurs références XML.")
+    elif LLM["kind"] == "openai":
+        st.caption(f"Modèle génératif : {LLM['label']}. Il appelle les mêmes outils ; si le modèle ne gère pas les outils, il rédige à partir des données extraites par le routeur.")
     else:
-        st.info("Aucune clé `ANTHROPIC_API_KEY` : l'assistant fonctionne en **mode hors ligne** (routage par mots-clés vers les mêmes outils). Définissez la clé pour des réponses en langage naturel.", icon="ℹ️")
+        st.info("Aucun modèle génératif configuré : l'assistant fonctionne en **mode hors ligne** (routeur par intention vers les mêmes outils, réponses sourcées).", icon="ℹ️")
+        with st.expander("Brancher un modèle d'IA générative sans clé Anthropic"):
+            st.markdown(
+                "**Option 1 — Ollama en local (gratuit, recommandé sur Mac)** : installez [ollama.com](https://ollama.com), puis dans un terminal :\n"
+                "```bash\nollama pull qwen2.5:7b\n```\n"
+                "Relancez l'application : Ollama est détecté automatiquement (port 11434). Pour choisir un autre modèle :\n"
+                "```bash\nexport LLM_BASE_URL=http://localhost:11434/v1\nexport LLM_MODEL=llama3.1:8b\n```\n"
+                "**Option 2 — LM Studio** (modèles Hugging Face avec interface graphique) : démarrez son serveur local, puis `LLM_BASE_URL=http://localhost:1234/v1` et `LLM_MODEL=<nom du modèle chargé>`.\n\n"
+                "**Option 3 — API gratuites en ligne** (compatibles OpenAI) : Groq (`https://api.groq.com/openai/v1`, modèle `llama-3.3-70b-versatile`), Mistral (`https://api.mistral.ai/v1`, `mistral-small-latest`), "
+                "OpenRouter (`https://openrouter.ai/api/v1`, modèles gratuits suffixés `:free`). Définissez `LLM_BASE_URL`, `LLM_MODEL` et `LLM_API_KEY`.\n\n"
+                "Dans tous les cas, le modèle n'a accès aux données que par les outils de l'application, et chaque réponse cite les objets XML consultés.")
 
     cols = st.columns(3)
     for i, s in enumerate(SUGGESTIONS):
@@ -633,9 +697,12 @@ def page_assistant():
         with st.chat_message("assistant"):
             with st.spinner("Consultation des données PLM…"):
                 try:
-                    if online:
+                    if LLM["kind"] == "claude":
                         text, calls, hist = assistant.ask_claude(tb, st.session_state.get("claude_history", []), q)
                         st.session_state.claude_history = hist
+                    elif LLM["kind"] == "openai":
+                        text, calls, hist = assistant.ask_openai_compatible(tb, LLM, st.session_state.get("llm_history", [])[-8:], q)
+                        st.session_state.llm_history = hist
                     else:
                         text, calls = assistant.ask_offline(tb, q)
                 except Exception as e:  # clé invalide, réseau…
@@ -644,7 +711,7 @@ def page_assistant():
         st.session_state.chat.append({"role": "assistant", "content": text, "calls": [{"name": c.name, "args": c.args, "refs": c.refs} for c in calls]})
         st.rerun()
     if st.session_state.chat and st.button("Effacer la conversation"):
-        st.session_state.chat, st.session_state.claude_history = [], []
+        st.session_state.chat, st.session_state.claude_history, st.session_state.llm_history = [], [], []
         st.rerun()
 
 
@@ -895,6 +962,39 @@ def page_bom_update():
             st.rerun()
         st.download_button("Modèle CSV", "name,kind,parent_occ,material,mass_kg,qty,rev,unit_cost,description\nCapteur de position rotor,part,79,Polyamide PA66-GF30,0.08,2,A,18.5,Capteur à effet Hall\nModule onduleur,assembly,0,,0,1,A,,Électronique de puissance\n", "modele_ajouts.csv")
         widget_close()
+        widget_open("Modifier un composant existant", "Révision, maturité, matière, masse, prix ou description. La cohérence parent/enfant est vérifiée : un parent ne peut pas être plus mûr que ses enfants.")
+        comp = MODEL.bom.loc[MODEL.bom["role"] != "geometry"].drop_duplicates("xml_id")
+        comp_labels = {x.xml_id: f"{x.short} · rév. {x.rev} · {x.maturity}" for x in comp.itertuples()}
+        with st.form("edit_comp"):
+            target = st.selectbox("Composant", list(comp_labels), format_func=comp_labels.get, index=list(comp_labels).index(st.session_state.get("edit_target", "ID_54")) if st.session_state.get("edit_target", "ID_54") in comp_labels else 0)
+            cur = comp.set_index("xml_id").loc[target]
+            a, b = st.columns(2)
+            e_rev = a.selectbox("Révision", list("ABCDEF"), index="ABCDEF".index(cur["rev"][0]) if cur["rev"][:1] in "ABCDEF" else 0)
+            e_mat = b.selectbox("Maturité", ["IN_WORK", "FROZEN", "RELEASED"], index=["IN_WORK", "FROZEN", "RELEASED"].index(cur["maturity"]) if cur["maturity"] in ("IN_WORK", "FROZEN", "RELEASED") else 0)
+            e_material = st.selectbox("Matière", ["(inchangée)"] + MATS["material"].tolist()) if cur["role"] == "part" else "(inchangée)"
+            a, b = st.columns(2)
+            e_mass = a.number_input("Masse unitaire (kg)", min_value=0.0, value=float(cur["mass_kg"]), step=0.01, format="%.3f") if cur["role"] == "part" else float(cur["mass_kg"])
+            e_cost = b.number_input("Prix unitaire (€, 0 = estimation)", min_value=0.0, value=float(cur["cost_override"]) if pd.notna(cur.get("cost_override")) else 0.0, step=0.5)
+            e_desc = st.text_input("Description", value=cur["description"] or "")
+            if st.form_submit_button("Enregistrer la modification", type="primary"):
+                e = {}
+                if e_rev != cur["rev"]: e["rev"] = e_rev
+                if e_mat != cur["maturity"]: e["maturity"] = e_mat
+                if e_material != "(inchangée)" and e_material != cur["material"]: e["material"] = e_material
+                if cur["role"] == "part" and abs(e_mass - float(cur["mass_kg"])) > 1e-9: e["mass_kg"] = e_mass
+                if e_cost: e["unit_cost"] = e_cost
+                if e_desc != (cur["description"] or ""): e["description"] = e_desc
+                if e:
+                    st.session_state.edits[target] = {**st.session_state.edits.get(target, {}), **e}
+                    # contrôle de cohérence immédiat
+                    trial = extras.apply_additions(BASE_MODEL, st.session_state.additions, st.session_state.edits)
+                    v = analytics.maturity_consistency(trial)
+                    if "maturity" in e and ((v["parent_occ"].isin(trial.bom.loc[trial.bom["xml_id"] == target, "occ"])).any() or (v["child_occ"].isin(trial.bom.loc[trial.bom["xml_id"] == target, "occ"])).any()):
+                        st.session_state["edit_warning"] = f"Modification enregistrée, mais elle crée une incohérence de maturité ({len(v)} lien(s) parent/enfant). Voir « Qualité des données »."
+                    st.rerun()
+        if st.session_state.get("edit_warning"):
+            st.warning(st.session_state.pop("edit_warning"))
+        widget_close()
     with r_:
         widget_open("Ajouts en cours", f"{len(st.session_state.additions)} ajout(s). Supprimez une ligne pour revenir en arrière ; l'export OEM n'est jamais modifié.")
         if st.session_state.additions:
@@ -912,13 +1012,36 @@ def page_bom_update():
         else:
             st.info("Aucun ajout pour l'instant. Le formulaire de gauche ajoute un composant ; le CSV en ajoute plusieurs.")
         widget_close()
+        widget_open("Modifications en cours", f"{len(st.session_state.edits)} composant(s) modifié(s).")
+        if st.session_state.edits:
+            names = MODEL.bom.drop_duplicates("xml_id").set_index("xml_id")["short"]
+            ed = pd.DataFrame([{"Composant": names.get(k, k), "Champs modifiés": ", ".join(f"{a} = {b}" for a, b in v.items()), "xml_id": k} for k, v in st.session_state.edits.items()])
+            ev2 = st.dataframe(ed, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="edit_tbl", column_config={"xml_id": None})
+            a, b = st.columns(2)
+            if ev2.selection.rows and a.button("Annuler cette modification"):
+                st.session_state.edits.pop(ed.iloc[ev2.selection.rows[0]]["xml_id"], None)
+                st.rerun()
+            if b.button("Annuler toutes les modifications"):
+                st.session_state.edits = {}
+                st.rerun()
+        else:
+            st.info("Aucune modification. Utilisez « Modifier un composant existant » à gauche.")
+        widget_close()
+        widget_open("Exporter", "Le XML modifié garde le schéma XPDMXML de l'OEM : objets existants mis à jour, nouveaux objets Product + ProductInst, en-tête tracé (Info ModifiedBy). Il peut être rechargé dans cette application ou transmis.")
+        src = ROOT / "data" / "_uploaded.xml" if st.session_state.xml_upload else XML_PATH
+        try:
+            xml_bytes = extras.export_xml(src, MODEL, st.session_state.additions, st.session_state.edits)
+            st.download_button("Télécharger le XML modifié (XPDMXML)", xml_bytes, f"XPDMXML_modifie_{extras.TODAY.isoformat()}.xml", type="primary", width="stretch")
+        except Exception as e:
+            st.error(f"Export impossible : {e}")
+        out = MODEL.bom.drop(columns=[c for c in ("children",) if c in MODEL.bom.columns])
+        st.download_button("Nomenclature enrichie (CSV)", out.to_csv(index=False).encode("utf-8"), "nomenclature_enrichie.csv", width="stretch")
+        widget_close()
         widget_open("Nomenclature enrichie", "Vue de contrôle : masses recalculées, ajouts surlignés par leur origine.")
         v = MODEL.bom.loc[MODEL.bom["role"] != "geometry", ["short", "level", "role_label", "rev", "material", "mass_kg", "origin", "occ"]].copy()
         v["short"] = v.apply(lambda x: (" " * int(x["level"])) + x["short"], axis=1)
         v = v.rename(columns={"short": "Composant", "role_label": "Type", "rev": "Rév.", "material": "Matière", "mass_kg": "Masse (kg)", "origin": "Origine", "occ": "occ"}).drop(columns="level")
         st.dataframe(v, hide_index=True, width="stretch", height=380, column_config={"Masse (kg)": st.column_config.NumberColumn(format="%.3f")})
-        out = MODEL.bom.drop(columns=[c for c in ("children",) if c in MODEL.bom.columns])
-        st.download_button("Exporter la nomenclature enrichie (CSV)", out.to_csv(index=False).encode("utf-8"), "nomenclature_enrichie.csv")
         widget_close()
 
 
@@ -996,7 +1119,7 @@ with st.sidebar:
 nav = st.navigation({"Analyse": [pages[k] for k in ("explorer", "intel", "impact", "assistant")], "Pilotage": [pages[k] for k in ("suppliers", "risks", "bom", "settings", "quality")]}, position="sidebar")
 with st.sidebar:
     st.markdown("---")
-    st.markdown(f'<div style="font-size:.75rem;color:#b7c4d9">Export : {html.escape(MODEL.source_name)}<br>{KPI["products"]} objets · {len(BOM)} occurrences<br>Référentiel matières : exemple<br>Ajouts manuels : {len(st.session_state.additions)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="font-size:.75rem;color:#b7c4d9">Export : {html.escape(MODEL.source_name)}<br>{KPI["products"]} objets · {len(BOM)} occurrences<br>Référentiel matières : exemple<br>Ajouts manuels : {len(st.session_state.additions)} · modifications : {len(st.session_state.edits)}</div>', unsafe_allow_html=True)
 target = st.session_state.pop("nav_target", None)
 if target:
     st.switch_page(pages[target])
