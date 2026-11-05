@@ -14,7 +14,7 @@ import pandas as pd
 
 from .parser import PlmModel, ROLE_LABEL
 
-TODAY = date(2026, 11, 4)
+TODAY = date.today()
 
 # Volatilité annuelle et dérive (hypothèses d'exemple) par famille de matière, pour la simulation de prix
 FAMILY_MARKET = {
@@ -172,13 +172,17 @@ def hedging_options(risk: pd.DataFrame, materials: pd.DataFrame, suppliers: pd.D
 NEW_ID_PREFIX = "NEW_"
 
 
-def apply_additions(base: PlmModel, additions: list[dict]) -> PlmModel:
+EDITABLE = ("maturity", "rev", "material", "mass_kg", "description", "unit_cost")
+
+
+def apply_additions(base: PlmModel, additions: list[dict], edits: dict | None = None) -> PlmModel:
     """Renvoie un modèle enrichi des composants ou sous-assemblages ajoutés à la main.
 
     Chaque ajout : {name, kind: part|assembly, parent_occ, material, mass_kg, qty, rev, unit_cost?, supplier_category?, description}.
     Les masses des parents sont augmentées ; la source est « saisie utilisateur » (xml_line = 0).
     """
-    if not additions:
+    edits = edits or {}
+    if not additions and not edits:
         if "cost_override" not in base.bom.columns:
             base.bom["cost_override"] = np.nan
             base.bom["origin"] = "XML"
@@ -190,6 +194,30 @@ def apply_additions(base: PlmModel, additions: list[dict]) -> PlmModel:
         bom["origin"] = "XML"
     rows = bom.to_dict("records")
     by_occ = {r["occ"]: r for r in rows}
+    # modifications de composants existants (par xml_id, toutes occurrences)
+    for xml_id, e in edits.items():
+        for r in rows:
+            if r["xml_id"] != xml_id:
+                continue
+            for k, v in e.items():
+                if k == "unit_cost":
+                    r["cost_override"] = v if v else np.nan
+                elif k == "rev":
+                    r["rev"], r["rev_index"] = v, ord(v[0]) - 64
+                elif k == "mass_kg":
+                    delta = float(v) - float(r["mass_kg"])
+                    r["mass_kg"] = float(v)
+                    p = by_occ.get(r["parent_occ"])
+                    while p is not None:
+                        p["mass_kg"] = round(p["mass_kg"] + delta, 3)
+                        p = by_occ.get(p["parent_occ"])
+                elif k in EDITABLE:
+                    r[k] = v
+            r["origin"] = "XML modifié" if r["origin"] == "XML" else r["origin"]
+            for g in rows:  # la représentation 3D rattachée suit la pièce
+                if g["parent_occ"] == r["occ"] and g["role"] == "geometry":
+                    for k in ("rev", "rev_index", "material", "mass_kg", "maturity"):
+                        g[k] = r[k]
     for n, a in enumerate(additions):
         parent = by_occ.get(a["parent_occ"])
         if parent is None:
@@ -225,3 +253,96 @@ def apply_additions(base: PlmModel, additions: list[dict]) -> PlmModel:
     prods = m.bom.drop_duplicates("xml_id").set_index("xml_id", drop=False)
     m.products = prods[[c for c in base.products.columns if c in prods.columns]]
     return m
+
+
+# ---------------------------------------------------------------------------
+# Export XPDMXML modifié
+# ---------------------------------------------------------------------------
+def export_xml(source_path, model: PlmModel, additions: list[dict], edits: dict | None = None) -> bytes:
+    """Réécrit l'export OEM avec les modifications et les ajouts, dans le même schéma XPDMXML.
+
+    - Les objets existants gardent leur identifiant ; seuls les champs modifiés changent (révision, maturité, matière, masse, description).
+    - Les ajouts deviennent de nouveaux Product + ProductInst (identifiants NEW_n, UniqueID préfixé « LOCAL- »).
+    - Un prix saisi est écrit dans un élément <Description> ou une extension ``SupplierExt.UnitCost`` (hors schéma OEM, mais lisible au réimport).
+    - Un <Info name="ModifiedBy"> est ajouté à l'en-tête pour tracer l'origine.
+    """
+    from lxml import etree
+
+    tree = etree.parse(str(source_path))
+    root = tree.getroot()
+    q = etree.QName(root)
+    ns = "{" + q.namespace + "}" if q.namespace else ""
+    ps = root.find(ns + "ProductStructure")
+    hdr = root.find(ns + "InfoHeader")
+    if hdr is not None:
+        info = etree.SubElement(hdr, ns + "Info")
+        info.set("name", "ModifiedBy")
+        info.set("value", f"PLM Intelligence (fournisseur) {TODAY.isoformat()} ; {len(additions)} ajout(s), {len(edits or {})} modification(s)")
+
+    def set_text(parent, tag, value):
+        el = parent.find(ns + tag)
+        if el is None:
+            el = etree.SubElement(parent, ns + tag)
+        el.text = str(value)
+
+    prods = {el.get("id"): el for el in ps.findall(ns + "Product")}
+    mass_tag = "WCGEquivalentComputedExt.V_WCG_Mass"
+    geo_of = {}
+    for g in model.bom.loc[model.bom["role"] == "geometry"].itertuples():
+        parent_id = model.bom.loc[model.bom["occ"] == g.parent_occ, "xml_id"]
+        if not parent_id.empty:
+            geo_of.setdefault(parent_id.iloc[0], set()).add(g.xml_id)
+    expanded = {}
+    for xml_id, e in (edits or {}).items():
+        expanded[xml_id] = e
+        for gid in geo_of.get(xml_id, ()):
+            expanded[gid] = {k: v for k, v in e.items() if k in ("rev", "maturity", "material", "mass_kg")}
+    for xml_id, e in expanded.items():
+        el = prods.get(xml_id)
+        if el is None:
+            continue
+        row = model.products.loc[xml_id] if xml_id in model.products.index else None
+        if "rev" in e:
+            set_text(el, "RevisionName", e["rev"]); set_text(el, "RevisionIndex", ord(e["rev"][0]) - 64)
+        if "maturity" in e:
+            set_text(el, "Maturity", e["maturity"])
+        if "material" in e:
+            set_text(el, "Material", e["material"])
+        if "mass_kg" in e:
+            set_text(el, mass_tag, f"{float(e['mass_kg']):.3f}")
+        if "description" in e:
+            set_text(el, "Description", e["description"])
+        if e.get("unit_cost"):
+            set_text(el, "SupplierExt.UnitCost", f"{float(e['unit_cost']):.2f}")
+        set_text(el, "TimeModified", f"{TODAY.isoformat()}T00:00:00.0Z")
+    # masses recalculées des assemblages (après modifications et ajouts)
+    for xml_id, el in prods.items():
+        if xml_id in model.products.index:
+            set_text(el, mass_tag, f"{float(model.products.loc[xml_id, 'mass_kg']):.3f}")
+
+    new_rows = model.bom.loc[model.bom["xml_id"].str.startswith(NEW_ID_PREFIX)]
+    done = set()
+    order = 1.0
+    for r in new_rows.itertuples():
+        if r.xml_id not in done:
+            done.add(r.xml_id)
+            el = etree.SubElement(ps, ns + "Product", id=r.xml_id)
+            for tag, val in [("ID", r.part_number), ("Name", r.name), ("Description", r.description or ""), ("RevisionName", r.rev), ("RevisionIndex", r.rev_index),
+                             ("Maturity", r.maturity), ("Lifecycle", "VPLM_SMB_Definition_MajorRev"), ("TimeCreated", f"{TODAY.isoformat()}T00:00:00.0Z"),
+                             ("TimeModified", f"{TODAY.isoformat()}T00:00:00.0Z"), ("Owner", "supplier_user"), ("Organization", "Fournisseur"), ("Project", r.project),
+                             ("SecurityLevel", "-1"), (mass_tag, f"{float(r.mass_kg):.3f}"), ("Material", r.material or "")]:
+                etree.SubElement(el, ns + tag).text = str(val)
+            uid = etree.SubElement(el, ns + "UniqueID")
+            uid.set("External", f"LOCAL-{r.xml_id}"); uid.set("XID", f"LOCAL-{r.xml_id}"); uid.set("locationOfControl", "SUPPLIER")
+            cost = model.bom.loc[model.bom["xml_id"] == r.xml_id, "cost_override"].iloc[0]
+            if pd.notna(cost):
+                etree.SubElement(el, ns + "SupplierExt.UnitCost").text = f"{float(cost):.2f}"
+        parent_id = model.bom.loc[model.bom["occ"] == r.parent_occ, "xml_id"].iloc[0]
+        inst = etree.SubElement(ps, ns + "ProductInst", id=r.inst)
+        for tag, val in [("ID", r.instance_name), ("Name", ""), ("Description", ""), ("Owned", parent_id), ("Instancing", r.xml_id), ("ChildOrder", f"{9e8 + order:.6f}")]:
+            etree.SubElement(inst, ns + tag).text = str(val)
+        order += 1
+        tr = etree.SubElement(inst, ns + "RelativeTransformation3D")
+        etree.SubElement(tr, ns + "Rotation3D").text = "1 0 0 0 1 0 0 0 1"
+        etree.SubElement(tr, ns + "Translation3D").text = "0 0 0"
+    return etree.tostring(tree, xml_declaration=True, encoding="UTF-8", pretty_print=True)

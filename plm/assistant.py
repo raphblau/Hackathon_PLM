@@ -255,6 +255,87 @@ def has_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
+def llm_backend() -> dict:
+    """Quel moteur génératif est disponible, par ordre de priorité :
+    1. Claude (ANTHROPIC_API_KEY) ;
+    2. tout serveur compatible OpenAI (LLM_BASE_URL + LLM_MODEL, clé LLM_API_KEY facultative) : Ollama ou LM Studio en local,
+       Groq, Mistral, OpenRouter, Hugging Face… en ligne ;
+    3. sinon le mode hors ligne (routeur par mots-clés)."""
+    if has_api_key():
+        return {"kind": "claude", "label": f"Claude ({MODEL_ID})"}
+    base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
+    model = os.environ.get("LLM_MODEL", "")
+    if base and model:
+        return {"kind": "openai", "label": f"{model} via {base}", "base": base, "model": model, "key": os.environ.get("LLM_API_KEY", "none")}
+    # Ollama lancé en local sans configuration explicite ?
+    try:
+        import requests
+        r = requests.get("http://localhost:11434/api/tags", timeout=0.8)
+        tags = [m["name"] for m in r.json().get("models", [])]
+        if tags:
+            pref = next((t for t in tags if any(k in t for k in ("qwen", "llama3", "mistral", "gemma"))), tags[0])
+            return {"kind": "openai", "label": f"{pref} via Ollama (local)", "base": "http://localhost:11434/v1", "model": pref, "key": "ollama"}
+    except Exception:
+        pass
+    return {"kind": "offline", "label": "mode hors ligne"}
+
+
+def _tools_openai(toolbox: Toolbox) -> list[dict]:
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]}} for t in toolbox.definitions()]
+
+
+def ask_openai_compatible(toolbox: Toolbox, backend: dict, history: list[dict], question: str, max_iterations: int = 6) -> tuple[str, list[ToolCall], list[dict]]:
+    """Boucle agentique sur un serveur compatible OpenAI (Ollama, LM Studio, Groq, Mistral, OpenRouter…).
+
+    Si le modèle ne sait pas appeler d'outils, on lui fournit le résultat du routeur hors ligne comme contexte
+    et on lui demande de rédiger la réponse : il reste sourcé.
+    """
+    import requests
+
+    url = backend["base"] + "/chat/completions"
+    headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": question}]
+    calls: list[ToolCall] = []
+    tools = _tools_openai(toolbox)
+    for _ in range(max_iterations):
+        payload = {"model": backend["model"], "messages": messages, "tools": tools, "temperature": 0.2}
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        if resp.status_code == 400 and tools:  # le modèle ne gère pas les outils : repli « contexte + rédaction »
+            return _ask_with_context(toolbox, backend, history, question)
+        resp.raise_for_status()
+        msg = resp.json()["choices"][0]["message"]
+        messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
+        if not msg.get("tool_calls"):
+            break
+        for tc in msg["tool_calls"]:
+            fn = tc["function"]
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            call = toolbox.run(fn["name"], args)
+            calls.append(call)
+            messages.append({"role": "tool", "tool_call_id": tc.get("id", fn["name"]), "content": json.dumps(call.result, ensure_ascii=False, default=str)[:40000]})
+    text = messages[-1].get("content") or ""
+    if not calls:  # aucun outil appelé : on sécurise avec le routeur, pour garder des chiffres sourcés
+        return _ask_with_context(toolbox, backend, history, question)
+    return text, calls, [m for m in messages[1:] if m["role"] in ("user", "assistant") and m.get("content")]
+
+
+def _ask_with_context(toolbox: Toolbox, backend: dict, history: list[dict], question: str) -> tuple[str, list[ToolCall], list[dict]]:
+    import requests
+
+    draft, calls = ask_offline(toolbox, question)
+    prompt = (f"Question de l'utilisateur : {question}\n\nDonnées PLM extraites par les outils (seule source autorisée, avec leurs références XML) :\n{draft}\n\n"
+              "Rédige une réponse claire en français, adaptée à la question, sans inventer de chiffre, et termine par la section « Sources » telle quelle.")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": prompt}]
+    resp = requests.post(backend["base"] + "/chat/completions", headers={"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"},
+                         json={"model": backend["model"], "messages": messages, "temperature": 0.2}, timeout=180)
+    resp.raise_for_status()
+    text = resp.json()["choices"][0]["message"].get("content") or draft
+    return text, calls, history + [{"role": "user", "content": question}, {"role": "assistant", "content": text}]
+
+
 def ask_claude(toolbox: Toolbox, history: list[dict], question: str, max_iterations: int = 8) -> tuple[str, list[ToolCall], list[dict]]:
     """Boucle agentique : Claude appelle les outils jusqu'à produire une réponse.
 
@@ -377,6 +458,12 @@ def ask_offline(toolbox: Toolbox, question: str) -> tuple[str, list[ToolCall]]:
     """Routeur hors ligne : détecte l'intention et l'entité, appelle les outils, cite les sources."""
     q = _norm(question)
     fam, sub, parts = _find_family(q), _find_sub(q), _find_part(toolbox, q)
+    if not sub:  # noms réels des sous-ensembles de niveau 1 (pour un autre export)
+        for name in toolbox.m.bom.loc[toolbox.m.bom["level"] == 1, "short"]:
+            if name.lower() in q:
+                sub = name
+    if sub and sub not in set(toolbox.m.bom.loc[toolbox.m.bom["level"] == 1, "short"]):
+        sub = None
     has = lambda *ws: any(w in q for w in ws)
     risk = toolbox.risk
 

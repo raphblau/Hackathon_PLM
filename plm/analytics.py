@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .parser import PlmModel
+from .parser import MATURITY_RANK, PlmModel
 
 RISK_LABEL = {1: "Faible", 2: "Moyen", 3: "Élevé"}
 CATALOG_CATEGORIES = {"Roulementier", "Visserie", "Joints élastomères"}
@@ -167,8 +167,36 @@ def change_impact(model: PlmModel, risk: pd.DataFrame, materials: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+def maturity_consistency(model: PlmModel) -> pd.DataFrame:
+    """Un parent ne peut pas être plus mûr (FROZEN/RELEASED) qu'un de ses enfants : liste des violations."""
+    b = model.bom.loc[model.bom["role"] != "geometry"]
+    rank = b["maturity"].map(MATURITY_RANK).fillna(0)
+    by_occ = b.set_index("occ")
+    rows = []
+    for r, rk in zip(b.itertuples(), rank):
+        if not r.parent_occ or r.parent_occ not in by_occ.index:
+            continue
+        p = by_occ.loc[r.parent_occ]
+        prk = MATURITY_RANK.get(p["maturity"], 0)
+        if prk > rk:
+            rows.append(dict(parent=p["short"], parent_maturity=p["maturity"], parent_occ=r.parent_occ, child=r.short, child_maturity=r.maturity, child_occ=r.occ,
+                             child_line=int(r.xml_line), rule=f"{p['maturity']} ne peut pas contenir {r.maturity}"))
+    return pd.DataFrame(rows, columns=["parent", "parent_maturity", "parent_occ", "child", "child_maturity", "child_occ", "child_line", "rule"])
+
+
+def maturity_status(model: PlmModel, occ: str) -> str:
+    """État de cohérence d'un composant : ok, enfant moins mûr que lui, ou parent plus mûr que lui."""
+    v = maturity_consistency(model)
+    if (v["parent_occ"] == occ).any():
+        return "Incohérent : contient des enfants moins mûrs"
+    if (v["child_occ"] == occ).any():
+        return "Incohérent : moins mûr que son parent"
+    return "Cohérent avec ses parents et enfants"
+
+
 def quality_checks(model: PlmModel) -> list[dict]:
     bom, prod = model.bom, model.products
+    viol = maturity_consistency(model)
     parts = bom.loc[bom["role"] == "part"]
     part_prod = parts.drop_duplicates("xml_id")
 
@@ -191,6 +219,9 @@ def quality_checks(model: PlmModel) -> list[dict]:
         for _, a in asm.iterrows()
     )
     return [
+        dict(level="Alerte" if len(viol) else "OK", title="Cohérence de maturité parent / enfant", count=len(viol),
+             text="Un assemblage FROZEN ou RELEASED ne peut pas contenir un enfant IN_WORK : sinon sa définition gelée dépend d'un objet qui peut encore changer."
+                  + (" Violations : " + "; ".join(f"{v.parent} ({v.parent_maturity}) → {v.child} ({v.child_maturity})" for v in viol.head(5).itertuples()) if len(viol) else "")),
         dict(level="Alerte", title="Aucune référence libérée", count=int((prod["maturity"] != "RELEASED").sum()), total=len(prod),
              text="Tous les objets sont IN_WORK : la définition peut encore changer. Toute décision d'industrialisation reste provisoire."),
         dict(level="Alerte", title="Même nom, plusieurs révisions", count=int(part_prod["name"].isin(multi_names).sum()),

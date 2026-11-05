@@ -18,8 +18,16 @@ Pour l'assistant en langage naturel (Claude), définissez une clé avant de lanc
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Sans clé, l'assistant fonctionne en **mode hors ligne** : un routeur par mots-clés appelle les
-mêmes outils, les réponses sont plus mécaniques mais toujours sourcées.
+Sans clé Anthropic, deux autres possibilités, par ordre de simplicité :
+
+1. **Ollama en local (gratuit)** : installer [ollama.com](https://ollama.com), puis `ollama pull qwen2.5:7b`. L'application détecte
+   Ollama automatiquement (port 11434). Pour imposer un modèle : `export LLM_BASE_URL=http://localhost:11434/v1` et `export LLM_MODEL=qwen2.5:7b`.
+2. **Tout serveur compatible OpenAI** : LM Studio en local (`http://localhost:1234/v1`), ou en ligne Groq, Mistral, OpenRouter (modèles
+   gratuits) : `export LLM_BASE_URL=…`, `export LLM_MODEL=…`, `export LLM_API_KEY=…`.
+
+Sans aucun modèle, l'assistant fonctionne en **mode hors ligne** : un routeur par intention (masse, coût, fiche, criticité, impact,
+choc de prix, structure, qualité) appelle les mêmes outils ; les réponses sont plus mécaniques mais toujours sourcées. Dans les
+trois cas, le modèle ne voit jamais le XML : il n'accède aux données que par les outils, qui portent leurs références.
 
 ## Pages
 
@@ -31,7 +39,7 @@ mêmes outils, les réponses sont plus mécaniques mais toujours sourcées.
 | Assistant PLM | Chat avec outils et citations XML (Claude ou mode hors ligne) |
 | Fournisseurs | Catalogue (`data/suppliers.csv`), contrats et échéances, ESG, délais de réponse, carte des sites, pièces nominées |
 | Risques & couverture | Registre (risques déduits + saisis), matrice probabilité × impact, options de couverture : forward/futures, matière alternative, seconde source, contrat, stock |
-| Mise à jour BOM | Ajout d'un composant / sous-assemblage / lot CSV, superposé à l'export OEM, avec prix saisi |
+| Mise à jour BOM | Ajout d'un composant / sous-assemblage / lot CSV, modification d'un composant existant (révision, maturité, matière, masse, prix), **export du XML modifié** au format XPDMXML, rechargeable |
 | Paramètres de criticité | Critères, pondérations, malus (révisions, contrats, ESG) et seuils, aperçu en direct, export du profil |
 | Qualité des données | Contrôles de l'export, en-tête, chargement d'un autre XML |
 
@@ -53,6 +61,19 @@ mêmes outils, les réponses sont plus mécaniques mais toujours sourcées.
 - **Du XML** : structure, références, révisions, maturité, cycle de vie, dates, propriétaire, masse, matière, représentations 3D.
 - **Catalogue fournisseurs (`suppliers.csv`)** : données d'exemple du fournisseur (noms fictifs). Les prévisions d'indices de prix sont une **simulation** déterministe (dérive et volatilité par famille), pas des cours de marché.
 - **Hypothèses (`materials_ref.csv`)** : prix €/kg, facteur procédé, CO₂, risque d'approvisionnement, catégorie de fournisseur. Ce sont des ordres de grandeur, à remplacer par les données achats. Tout chiffre qui en dépend est marqué « hypothèse » dans l'interface.
+
+## Cohérence de maturité parent / enfant
+
+Règle appliquée : un assemblage `FROZEN` ou `RELEASED` ne peut pas contenir un enfant `IN_WORK` (ordre IN_WORK < FROZEN < RELEASED).
+Les violations sont listées dans « Qualité des données », signalées dans la nomenclature (colonne Cohérence) et dans le panneau de
+propriétés, et vérifiées à chaque modification de maturité.
+
+## Export et import de XML
+
+« Mise à jour BOM » exporte un **XPDMXML modifié** : les objets existants gardent leur identifiant et reçoivent les champs modifiés,
+les ajouts deviennent de nouveaux `Product` + `ProductInst` (identifiants `NEW_n`, `UniqueID` préfixé `LOCAL-`), un prix saisi est
+écrit dans `SupplierExt.UnitCost` (hors schéma OEM) et l'en-tête reçoit un `Info ModifiedBy`. Le lecteur accepte tout XPDMXML :
+il détecte l'espace de noms, la balise de masse (`*Mass*`), les préfixes de nom (`XXX-EI_`, `XXX-3D_`) et plusieurs racines.
 
 ## Méthodes
 

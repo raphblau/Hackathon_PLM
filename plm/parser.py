@@ -12,12 +12,14 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+import re
 from pathlib import Path
 
 import pandas as pd
 from lxml import etree
 
-NS = "{http://www.3ds.com/xsd/XPDMXML}"
+NS = "{http://www.3ds.com/xsd/XPDMXML}"  # remplacé par l'espace de noms réel du fichier au chargement
+MATURITY_RANK = {"IN_WORK": 0, "PRIVATE": 0, "FROZEN": 1, "RELEASED": 2, "OBSOLETE": 3}
 
 ROLE_LABEL = {
     "assembly": "Assemblage",
@@ -81,20 +83,37 @@ def _text(el, tag: str) -> str:
     return (x.text or "").strip() if x is not None else ""
 
 
+def _mass(el) -> float:
+    """Masse : balise V_WCG_Mass ou toute balise dont le nom contient « Mass »."""
+    for child in el:
+        tag = etree.QName(child).localname
+        if tag.endswith("V_WCG_Mass") or "Mass" in tag:
+            try:
+                return float((child.text or "0").strip() or 0)
+            except ValueError:
+                pass
+    return 0.0
+
+
+_PREFIX = re.compile(r"^[A-Z0-9]{2,8}-(?:EI_|3D_|3D |EI |3D)?", re.I)
+
+
 def short_name(name: str) -> str:
-    for prefix in ("ECAR-EI_", "ECAR-3D_", "ECAR-3D ", "ECAR-"):
-        if name.startswith(prefix):
-            return name[len(prefix):].strip()
-    return name
+    """Enlève le préfixe projet (ECAR-EI_, XYZ-3D_, …) pour un nom lisible."""
+    return (_PREFIX.sub("", name) or name).strip()
 
 
 def load(path: str | Path) -> PlmModel:
+    global NS
     path = Path(path)
     root = etree.parse(str(path)).getroot()
+    q = etree.QName(root)
+    NS = "{" + q.namespace + "}" if q.namespace else ""
+    if root.find(NS + "ProductStructure") is None:
+        raise ValueError("Ce fichier n'est pas un export XPDMXML : pas d'élément ProductStructure.")
 
-    info = pd.DataFrame(
-        [{"name": i.get("name"), "value": i.get("value")} for i in root.find(NS + "InfoHeader")]
-    )
+    hdr = root.find(NS + "InfoHeader")
+    info = pd.DataFrame([{"name": i.get("name"), "value": i.get("value")} for i in hdr] if hdr is not None else [{"name": "InfoHeader", "value": "absent"}])
 
     products: dict[str, dict] = {}
     instances: list[dict] = []
@@ -119,7 +138,7 @@ def load(path: str | Path) -> PlmModel:
                 "owner": _text(el, "Owner"),
                 "organization": _text(el, "Organization"),
                 "project": _text(el, "Project"),
-                "mass_kg": float(_text(el, "WCGEquivalentComputedExt.V_WCG_Mass") or 0),
+                "mass_kg": _mass(el),
                 "material": _text(el, "Material"),
             }
         elif tag == "ProductInst":
@@ -141,6 +160,8 @@ def load(path: str | Path) -> PlmModel:
         kids[k].sort(key=lambda x: x["order"])
 
     roots = [pid for pid in products if pid not in {i["child"] for i in instances}]
+    if not roots and products:
+        roots = [next(iter(products))]
     rows: list[dict] = []
     by_occ: dict[str, dict] = {}
     children: dict[str, list[str]] = defaultdict(list)
